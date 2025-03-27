@@ -1,0 +1,8 @@
+# this corresponds to the default config
+train:
+  dataset_path: Pods:cell=Custom
+  batch_size_per_gpu: 64
+  cache_dataset: false
+  output_dir: train_dir/dinov2_vitb16
+student:
+  arch: vit_base

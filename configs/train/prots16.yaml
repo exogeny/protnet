@@ -1,0 +1,9 @@
+# this corresponds to the default config
+train:
+  dataset_path: Pods:split=train:root=/mnt/data2/human_protein_atlas/Custom
+  batch_size_per_gpu: 64
+  cache_dataset: true
+  output_dir: train_dir/proteinnet/baseline
+student:
+  arch: prot_small
+  ffn_layer: mlp

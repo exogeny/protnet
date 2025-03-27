@@ -1,0 +1,10 @@
+einops
+omegaconf
+torchmetrics
+fvcore
+iopath
+xformers
+submitit
+wheel
+--extra-index-url https://pypi.nvidia.com
+cuml-cu12

@@ -1,0 +1,672 @@
+from typing import List, Optional
+import json
+import logging
+import os
+import sys
+import argparse
+from functools import partial
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
+from fvcore.common.checkpoint import Checkpointer, PeriodicCheckpointer
+
+from prot import distributed
+from prot.data import SamplerType, make_data_loader, make_dataset
+from prot.data.transforms import make_classification_train_transform
+from prot.data.transforms import make_classification_eval_transform
+from prot.utils.helpers import MetricLogger
+from prot.eval.metrics import MetricType, build_metric
+from prot.eval.setup import setup_and_build_model
+from prot.eval.setup import get_args_parser as get_setup_args_parser
+from prot.eval.utils import ModelWithIntermediateLayers, evaluate
+from prot.utils import wandb
+
+logger = logging.getLogger('prot')
+
+
+def get_args_parser(
+    description: Optional[str] = None,
+    parents: Optional[List[argparse.ArgumentParser]] = None,
+    add_help: bool = True,
+):
+  parents = parents or []
+  setup_args_parser = get_setup_args_parser(parents=parents, add_help=False)
+  parents.append(setup_args_parser)
+  parser = argparse.ArgumentParser(
+      description=description,
+      parents=parents,
+      add_help=add_help,
+  )
+  parser.add_argument(
+      '--train-dataset',
+      dest='train_dataset_str',
+      type=str,
+      help='Training dataset',
+  )
+  parser.add_argument(
+      '--val-dataset',
+      dest='val_dataset_str',
+      type=str,
+      help='Validation dataset',
+  )
+  parser.add_argument(
+      '--test-datasets',
+      dest='test_dataset_strs',
+      type=str,
+      nargs='+',
+      help='Test datasets, none to reuse the validation dataset',
+  )
+  parser.add_argument(
+      '--epochs',
+      type=int,
+      help='Number of training epochs',
+  )
+  parser.add_argument(
+      '--batch-size',
+      type=int,
+      help='Batch Size (per GPU)',
+  )
+  parser.add_argument(
+      '--num-workers',
+      type=int,
+      help='Number de Workers',
+  )
+  parser.add_argument(
+      '--save-checkpoint-frequency',
+      type=int,
+      help='Number of epochs between two named checkpoint saves.',
+  )
+  parser.add_argument(
+      '--learning-rates',
+      nargs='+',
+      type=float,
+      help='Learning rates to grid search.',
+  )
+  parser.add_argument(
+      '--no-resume',
+      action='store_true',
+      help='Whether to not resume from existing checkpoints',
+  )
+  parser.add_argument(
+      '--val-metric-type',
+      type=MetricType,
+      choices=list(MetricType),
+      help='Validation metric',
+  )
+  parser.add_argument(
+      '--test-metric-types',
+      type=MetricType,
+      choices=list(MetricType),
+      nargs='+',
+      help='Evaluation metric',
+  )
+  parser.add_argument(
+      '--classifier-fpath',
+      type=str,
+      help='Path to a file containing pretrained linear classifiers',
+  )
+  parser.add_argument(
+      '--val-class-mapping-fpath',
+      type=str,
+      help='Path to a file containing a mapping to adjust classifier outputs',
+  )
+  parser.add_argument(
+      '--test-class-mapping-fpaths',
+      nargs='+',
+      type=str,
+      help='Path to a file containing a mapping to adjust classifier outputs',
+  )
+  parser.add_argument(
+      '--multilabel',
+      type=bool,
+      default=False,
+      help='class for multi-label'
+  )
+  parser.set_defaults(
+      train_dataset_str='Pods:split=train',
+      val_dataset_str='Pods:split=test',
+      test_dataset_strs=None,
+      epochs=20,
+      batch_size=256,
+      num_workers=8,
+      save_checkpoint_frequency=10,
+      learning_rates=[1e-3, 2e-3, 5e-3, 1e-2, 2e-2, 5e-2, 0.1],
+      val_metric_type=MetricType.CONFUSION_MATRIX,
+      test_metric_types=None,
+      classifier_fpath=None,
+      val_class_mapping_fpath=None,
+      test_class_mapping_fpaths=[None],
+      multilabel=False,
+  )
+  wandb.set_wandb_args_parser(parser)
+  return parser
+
+
+def has_ddp_wrapper(m: nn.Module) -> bool:
+  return isinstance(m, DistributedDataParallel)
+
+
+def remove_ddp_wrapper(m: nn.Module) -> nn.Module:
+  return m.module if has_ddp_wrapper(m) else m
+
+
+def _pad_and_collate(batch):
+  maxlen = max(len(targets) for image, targets in batch)
+  padded_batch = [
+      (image, np.pad(targets, (0, maxlen - len(targets)), constant_values=-1))
+      for image, targets in batch
+  ]
+  return torch.utils.data.default_collate(padded_batch)
+
+
+def create_linear_input(x_tokens_list, use_n_blocks, use_avgpool):
+  intermediate_output = x_tokens_list[-use_n_blocks:]
+  output = torch.cat([class_token for _, class_token in intermediate_output], dim=-1)
+  if use_avgpool:
+    output = torch.cat(
+        [
+            output,
+            torch.mean(intermediate_output[-1][0], dim=1),  # patch tokens
+        ],
+        dim=-1,
+    )
+    output = output.reshape(output.shape[0], -1)
+  return output.float()
+
+
+class LinearClassifier(nn.Module):
+  """Linear layer to train on top of frozen features"""
+  def __init__(self, out_dim, use_n_blocks, use_avgpool, num_classes=1000):
+    super().__init__()
+    self.out_dim = out_dim
+    self.use_n_blocks = use_n_blocks
+    self.use_avgpool = use_avgpool
+    self.num_classes = num_classes
+    self.linear = nn.Linear(out_dim, num_classes)
+    self.linear.weight.data.normal_(mean=0.0, std=0.01)
+    self.linear.bias.data.zero_()
+
+  def forward(self, x_tokens_list):
+    output = create_linear_input(x_tokens_list, self.use_n_blocks, self.use_avgpool)
+    return self.linear(output)
+
+
+class ClassifierCollection(nn.Module):
+  def __init__(self, classifiers_dict):
+    super().__init__()
+    self.classifiers_dict = nn.ModuleDict()
+    self.classifiers_dict.update(classifiers_dict)
+
+  def forward(self, inputs):
+    return {k: v.forward(inputs) for k, v in self.classifiers_dict.items()}
+
+  def __len__(self):
+    return len(self.classifiers_dict)
+
+
+class LinearPostprocessor(nn.Module):
+  def __init__(self, linear_classifier, class_mapping=None, multilabel=False):
+    super().__init__()
+    self.linear_classifier = linear_classifier
+    self.multilabel = multilabel
+    class_mapping = None if class_mapping is None else torch.LongTensor(class_mapping)
+    self.register_buffer('class_mapping', class_mapping)
+
+  def forward(self, samples, targets):
+    preds = self.linear_classifier(samples)
+    if not self.multilabel:
+      return {
+          'preds': preds[:, self.class_mapping] if self.class_mapping is not None else preds,
+          'target': targets,
+      }
+    else:
+      return {
+          'preds': preds.sigmoid(),
+          'target': targets,
+      }
+
+
+def scale_lr(learning_rates, batch_size):
+  return learning_rates * (batch_size * distributed.get_global_size()) / 256.0
+
+
+def setup_linear_classifiers(sample_output, n_last_blocks_list, learning_rates, batch_size, num_classes=1000):
+  linear_classifiers_dict = nn.ModuleDict()
+  optim_param_groups = []
+  for n in n_last_blocks_list:
+    for avgpool in [False, True]:
+      for _lr in learning_rates:
+        lr = scale_lr(_lr, batch_size)
+        out_dim = create_linear_input(
+            sample_output, use_n_blocks=n, use_avgpool=avgpool).shape[1]
+        linear_classifier = LinearClassifier(
+            out_dim, use_n_blocks=n, use_avgpool=avgpool, num_classes=num_classes
+        )
+        model_name = f'classifier_{n}_blocks_avgpool_{avgpool}_lr_{lr:.5f}'
+        model_name = model_name.replace('.', '_')
+        linear_classifier = linear_classifier.cuda()
+        linear_classifiers_dict[model_name] = linear_classifier
+        optim_param_groups.append({
+           'params': linear_classifier.parameters(), 'lr': lr
+        })
+  linear_classifiers = ClassifierCollection(linear_classifiers_dict)
+  if distributed.is_enabled():
+    linear_classifiers = nn.parallel.DistributedDataParallel(linear_classifiers)
+  return linear_classifiers, optim_param_groups
+
+
+@torch.no_grad()
+def evaluate_linear_classifiers(
+    feature_model,
+    linear_classifiers,
+    data_loader,
+    metric_type,
+    metrics_file_path,
+    training_num_classes,
+    iteration,
+    prefixstring='',
+    class_mapping=None,
+    multilabel=False,
+    best_classifier_on_val=None,
+):
+  logger.info('running linear classifiers evaluation')
+
+  num_classes = len(class_mapping) if class_mapping is not None else training_num_classes
+  metric = build_metric(metric_type, num_classes=num_classes)
+  postprocessors = {k: LinearPostprocessor(v, class_mapping, multilabel) for k, v in linear_classifiers.classifiers_dict.items()}
+  metrics = {k: metric.clone() for k in linear_classifiers.classifiers_dict}
+
+  _, results_dict_temp = evaluate(
+      feature_model,
+      data_loader,
+      postprocessors,
+      metrics,
+      torch.cuda.current_device(),
+  )
+
+  results_dict = {}
+  max_accuracy = 0
+  best_classifier = ''
+
+  for i, (classifier_string, metric) in enumerate(results_dict_temp.items()):
+    if metric_type in (MetricType.CONFUSION_MATRIX, MetricType.MULTILABEL_CONFUSION_MATRIX):
+      logger.info(f'{prefixstring} -- Classifier: {classifier_string}')
+      matrix = metric['cm']
+      if metric_type == MetricType.CONFUSION_MATRIX:
+        tp = torch.diag(matrix)
+        fp = matrix.sum(dim=0) - tp
+        fn = matrix.sum(dim=1) - tp
+      elif MetricType.MULTILABEL_CONFUSION_MATRIX:
+        tp = matrix[:, 1, 1]
+        fp = matrix[:, 0, 1]
+        fn = matrix[:, 1, 0]
+      p = tp / (tp + fp + 1e-8)
+      r = tp / (tp + fn + 1e-8)
+      f1 = 2 * (p * r) / (p + r + 1e-8)
+      f1_micro = 2 * torch.sum(tp) / (
+          2 * torch.sum(tp) + torch.sum(fp) + torch.sum(fn) + 1e-8)
+      support = tp + fn
+      support_prob = support / torch.sum(support)
+      logger.info(f'**** Test Confusion Matrix ****')
+      logger.info(f'** f1-score@macro: {f1.mean()}')
+      logger.info(f'** f1-score@micro: {f1_micro}')
+      logger.info(f'** f1-score@weighted: {torch.sum(f1 * support_prob)}')
+      logger.info(f'** precision@macro: {torch.mean(p)}')
+      logger.info(f'** precision@weighted: {torch.sum(p * support_prob)}')
+      logger.info(f'** recall@macro: {torch.mean(r)}')
+      logger.info(f'** recall@weighted: {torch.sum(r * support_prob)}')
+      logger.info(f'*******************************')
+      if (
+          best_classifier_on_val is None and f1_micro.item() > max_accuracy
+      ) or classifier_string == best_classifier_on_val:
+        max_accuracy = f1_micro.item()
+        best_classifier = classifier_string
+    else:
+      logger.info(f"{prefixstring} -- Classifier: {classifier_string} * {metric}")
+      if (
+          best_classifier_on_val is None and metric['top-1'].item() > max_accuracy
+      ) or classifier_string == best_classifier_on_val:
+        max_accuracy = metric['top-1'].item()
+        best_classifier = classifier_string
+
+  results_dict['best_classifier'] = {
+      'name': best_classifier,
+      'accuracy': max_accuracy,
+  }
+  logger.info(f'best classifier: {results_dict["best_classifier"]}')
+
+  if distributed.is_main_process():
+    with open(metrics_file_path, 'a') as f:
+      f.write(f'iter: {iteration}\n')
+      for k, v in results_dict.items():
+        f.write(f'{json.dumps({k: v})}\n')
+      f.write('\n')
+  return results_dict
+
+
+def eval_linear(
+    *,
+    feature_model,
+    linear_classifiers,
+    train_data_loader,
+    val_data_loader,
+    metrics_file_path,
+    optimizer,
+    scheduler,
+    output_dir,
+    max_iter,
+    checkpoint_period,  # In number of iter, creates a new file every period
+    running_checkpoint_period,  # Period to update main checkpoint file
+    eval_period,
+    metric_type,
+    training_num_classes,
+    multilabel=False,
+    resume=True,
+    classifier_fpath=None,
+    val_class_mapping=None,
+):
+  checkpointer = Checkpointer(linear_classifiers, output_dir, optimizer=optimizer, scheduler=scheduler)
+  start_iter = checkpointer.resume_or_load(classifier_fpath or '', resume=resume).get('iteration', -1) + 1
+  periodic_checkpointer = PeriodicCheckpointer(checkpointer, checkpoint_period, max_iter=max_iter)
+  iteration = start_iter
+  logger.info(f'starting from iteration {start_iter}')
+  metric_logger = MetricLogger(delimiter='  ')
+  header = "Training"
+
+  for data, labels in metric_logger.log_every(
+      train_data_loader,
+      10,
+      header,
+      max_iter,
+      start_iter,
+  ):
+    data = data.cuda(non_blocking=True)
+    labels = labels.cuda(non_blocking=True)
+    features = feature_model(data)
+    outputs = linear_classifiers(features)
+    if multilabel:
+      losses = {
+          f'loss_{k}': nn.BCEWithLogitsLoss()(v, labels)
+          for k, v in outputs.items()
+      }
+    else:
+      losses = {
+          f'loss_{k}': nn.CrossEntropyLoss()(v, labels)
+          for k, v in outputs.items()
+      }
+    loss = sum(losses.values())
+
+    # compute the gradients and update the optimizer
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+
+    if iteration % 10 == 0:
+      torch.cuda.synchronize()
+      metric_logger.update(loss=loss.item())
+      metric_logger.update(lr=optimizer.param_groups[0]['lr'])
+
+    if iteration - start_iter > 5:
+      if iteration % running_checkpoint_period == 0:
+        torch.cuda.synchronize()
+        if distributed.is_main_process():
+          logger.info('Checkpointing...')
+          periodic_checkpointer.save(f'running_checkpoint_linear_eval_{iteration:07d}')
+        torch.cuda.synchronize()
+    periodic_checkpointer.step(iteration)
+
+    if eval_period > 0 and (iteration + 1) % eval_period == 0 and iteration != max_iter - 1:
+      _ = evaluate_linear_classifiers(
+          feature_model=feature_model,
+          linear_classifiers=remove_ddp_wrapper(linear_classifiers),
+          data_loader=val_data_loader,
+          metrics_file_path=metrics_file_path,
+          prefixstring=f'ITER: {iteration}',
+          metric_type=metric_type,
+          training_num_classes=training_num_classes,
+          iteration=iteration,
+          class_mapping=val_class_mapping,
+          multilabel=multilabel,
+      )
+      torch.cuda.synchronize()
+    iteration += 1
+
+  val_results_dict = evaluate_linear_classifiers(
+      feature_model=feature_model,
+      linear_classifiers=remove_ddp_wrapper(linear_classifiers),
+      data_loader=val_data_loader,
+      metrics_file_path=metrics_file_path,
+      metric_type=metric_type,
+      training_num_classes=training_num_classes,
+      iteration=iteration,
+      class_mapping=val_class_mapping,
+      multilabel=multilabel,
+  )
+  return val_results_dict, feature_model, linear_classifiers, iteration
+
+
+def make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type):
+  test_dataset = make_dataset(
+      dataset_str=test_dataset_str,
+      transform=make_classification_eval_transform(),
+  )
+  test_data_loader = make_data_loader(
+      dataset=test_dataset,
+      batch_size=batch_size,
+      num_workers=num_workers,
+      sampler_type=SamplerType.DISTRIBUTED,
+      drop_last=False,
+      shuffle=False,
+      persistent_workers=False,
+      collate_fn=_pad_and_collate if metric_type == MetricType.IMAGENET_REAL_ACCURACY else None,
+  )
+  return test_data_loader
+
+
+def test_on_datasets(
+    feature_model,
+    linear_classifiers,
+    test_dataset_strs,
+    batch_size,
+    num_workers,
+    test_metric_types,
+    metrics_file_path,
+    training_num_classes,
+    iteration,
+    best_classifier_on_val,
+    prefixstring: str = '',
+    test_class_mappings=[None],
+):
+  results_dict = {}
+  for test_dataset_str, class_mapping, metric_type in zip(test_dataset_strs, test_class_mappings, test_metric_types):
+    logger.info(f'Testing on {test_dataset_str}')
+    test_data_loader = make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type)
+    dataset_results_dict = evaluate_linear_classifiers(
+        feature_model,
+        remove_ddp_wrapper(linear_classifiers),
+        test_data_loader,
+        metric_type,
+        metrics_file_path,
+        training_num_classes,
+        iteration,
+        prefixstring=prefixstring,
+        class_mapping=class_mapping,
+        best_classifier_on_val=best_classifier_on_val,
+    )
+    results_dict[f'{test_dataset_str}_accuracy'] = (
+        100.0 * dataset_results_dict['best_classifier']['accuracy']
+    )
+  return results_dict
+
+
+def run_eval_linear(
+    model,
+    output_dir,
+    train_dataset_str,
+    val_dataset_str,
+    batch_size,
+    epochs,
+    num_workers,
+    save_checkpoint_frequency,
+    learning_rates,
+    autocast_dtype,
+    test_dataset_strs=None,
+    resume=True,
+    classifier_fpath=None,
+    val_class_mapping_fpath=None,
+    test_class_mapping_fpaths=[None],
+    val_metric_type=MetricType.MEAN_ACCURACY,
+    test_metric_types=None,
+    multilabel=False,
+):
+  seed = 0
+  if test_dataset_strs is None:
+    test_dataset_strs = [val_dataset_str]
+  if test_metric_types is None:
+    test_metric_types = [val_metric_type] * len(test_dataset_strs)
+  else:
+    assert len(test_metric_types) == len(test_dataset_strs)
+  assert len(test_dataset_strs) == len(test_class_mapping_fpaths)
+
+  train_transform = make_classification_train_transform()
+  train_dataset = make_dataset(
+      dataset_str=train_dataset_str,
+      transform=train_transform,
+  )
+  training_num_classes = len(torch.unique(torch.Tensor(train_dataset.get_targets().astype(int))))
+  sampler_type = SamplerType.SHARDED_INFINITE
+  epoch_length = len(train_dataset) // (batch_size * distributed.get_global_size())
+  logger.info(f'Runing for {epoch_length} iterations per epoch')
+
+  n_last_blocks_list = [1, 4]
+  n_last_blocks = max(n_last_blocks_list)
+  autocast_ctx = partial(
+      torch.amp.autocast, enabled=True, device_type='cuda', dtype=autocast_dtype)
+  feature_model = ModelWithIntermediateLayers(model, n_last_blocks, autocast_ctx)
+  sample_output = feature_model(train_dataset[0][0].unsqueeze(0).cuda())
+
+  linear_classifiers, optim_param_groups = setup_linear_classifiers(
+      sample_output,
+      n_last_blocks_list,
+      learning_rates,
+      batch_size,
+      training_num_classes,
+  )
+
+  optimizer = torch.optim.SGD(optim_param_groups, momentum=0.9, weight_decay=0)
+  max_iter = epochs * epoch_length
+  scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, max_iter, eta_min=0)
+  checkpointer = Checkpointer(linear_classifiers, output_dir, optimizer=optimizer, scheduler=scheduler)
+  start_iter = checkpointer.resume_or_load(
+      classifier_fpath or '', resume=resume).get('iteration', -1) + 1
+  train_data_loader = make_data_loader(
+      dataset=train_dataset,
+      batch_size=batch_size,
+      num_workers=num_workers,
+      shuffle=True,
+      seed=seed,
+      sampler_type=sampler_type,
+      sampler_advance=start_iter,
+      drop_last=True,
+      persistent_workers=True,
+  )
+  val_data_loader = make_eval_data_loader(val_dataset_str, batch_size, num_workers, val_metric_type)
+  checkpoint_period = save_checkpoint_frequency * epoch_length
+
+  if val_class_mapping_fpath is not None:
+    logger.info(f'Using val class mapping from {val_class_mapping_fpath}')
+    val_class_mapping = np.load(val_class_mapping_fpath)
+  else:
+    val_class_mapping = None
+
+  test_class_mappings = []
+  for class_mapping_fpath in test_class_mapping_fpaths:
+    if class_mapping_fpath is not None and class_mapping_fpath != 'None':
+      logger.info(f'Using class mapping from {class_mapping_fpath}')
+      class_mapping = np.load(class_mapping_fpath)
+    else:
+      class_mapping = None
+    test_class_mappings.append(class_mapping)
+
+  results_dict = {}
+  metrics_file_path = os.path.join(output_dir, 'results_eval_linear.json')
+  val_results_dict, feature_model, linear_classifiers, iteration = eval_linear(
+      feature_model=feature_model,
+      linear_classifiers=linear_classifiers,
+      multilabel=multilabel,
+      train_data_loader=train_data_loader,
+      val_data_loader=val_data_loader,
+      metrics_file_path=metrics_file_path,
+      optimizer=optimizer,
+      scheduler=scheduler,
+      output_dir=output_dir,
+      max_iter=max_iter,
+      checkpoint_period=checkpoint_period,
+      running_checkpoint_period=epoch_length,
+      eval_period=epoch_length,
+      metric_type=val_metric_type,
+      training_num_classes=training_num_classes,
+      resume=resume,
+      val_class_mapping=val_class_mapping,
+      classifier_fpath=classifier_fpath,
+  )
+  if len(test_dataset_strs) > 1 or test_dataset_strs[0] != val_dataset_str:
+    results_dict = test_on_datasets(
+        feature_model,
+        linear_classifiers,
+        test_dataset_strs,
+        batch_size,
+        0,  # num_workers,
+        test_metric_types,
+        metrics_file_path,
+        training_num_classes,
+        iteration,
+        val_results_dict['best_classifier']['name'],
+        prefixstring='',
+        test_class_mappings=test_class_mappings,
+    )
+  results_dict['best_classifier'] = val_results_dict['best_classifier']['name']
+  results_dict[f'{val_dataset_str}_accuracy'] = (
+      100.0 * val_results_dict['best_classifier']['accuracy']
+  )
+  logger.info(f'Test Results Dict {str(results_dict)}.')
+  return results_dict
+
+
+def main(args):
+  model, autocast_dtype = setup_and_build_model(args)
+  run_eval_linear(
+      model=model,
+      output_dir=args.output_dir,
+      train_dataset_str=args.train_dataset_str,
+      val_dataset_str=args.val_dataset_str,
+      test_dataset_strs=args.test_dataset_strs,
+      batch_size=args.batch_size,
+      epochs=args.epochs,
+      num_workers=args.num_workers,
+      save_checkpoint_frequency=args.save_checkpoint_frequency,
+      learning_rates=args.learning_rates,
+      autocast_dtype=autocast_dtype,
+      resume=not args.no_resume,
+      classifier_fpath=args.classifier_fpath,
+      val_metric_type=args.val_metric_type,
+      test_metric_types=args.test_metric_types,
+      val_class_mapping_fpath=args.val_class_mapping_fpath,
+      test_class_mapping_fpaths=args.test_class_mapping_fpaths,
+      multilabel=args.multilabel,
+  )
+  return 0
+
+
+if __name__ == '__main__':
+  description = 'Evaluate linear classifiers on top of frozen features'
+  parser = get_args_parser(description=description)
+  args = parser.parse_args()
+  wandb.init(
+      args, project='prot-linear',
+      name=os.path.basename(os.path.abspath(args.output_dir)),
+  )
+  sys.exit(main(args))
