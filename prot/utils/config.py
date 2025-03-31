@@ -48,6 +48,8 @@ def get_cfg_from_args(args):
   opts = args.opts or []
   args.opts = opts + [f'train.output_dir={args.output_dir}']
   default_cfg = OmegaConf.create(default_config)
+  if not os.path.exists(args.config_file) or not os.path.isfile(args.config_file):
+    raise FileNotFoundError(f"Config file not found: {args.config_file}")
   cfg = OmegaConf.load(args.config_file)
   cfg = OmegaConf.merge(default_cfg, cfg, OmegaConf.from_cli(args.opts))
   return cfg

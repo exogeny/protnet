@@ -55,7 +55,6 @@ def build_metric(
         ks=(1, 5) if ks is None else ks,
     )
   elif metric_type == MetricType.CONFUSION_MATRIX:
-    logger.info(f'Building confusion matrix metric for {num_classes} classes')
     return build_confusion_matrix_metric(
         num_classes=num_classes,
         task='multiclass',
@@ -90,6 +89,66 @@ def build_confusion_matrix_metric(num_classes: int, task: str = 'multiclass'):
       ),
   }
   return MetricCollection(metrics)
+
+
+class ConfusionMatrixResult:
+  def __init__(self, metric_type, confusion_matrix: Tensor):
+    confusion_matrix = confusion_matrix.detach().cpu()
+    if metric_type == MetricType.CONFUSION_MATRIX:
+      tp = torch.diag(confusion_matrix)
+      fp = confusion_matrix.sum(dim=0) - tp
+      fn = confusion_matrix.sum(dim=1) - tp
+    elif metric_type == MetricType.MULTILABEL_CONFUSION_MATRIX:
+      tp = confusion_matrix[:, 1, 1]
+      fp = confusion_matrix[:, 0, 1]
+      fn = confusion_matrix[:, 1, 0]
+    else:
+      raise ValueError(
+          f'Unknown metric type {metric_type},'
+          f' expected {MetricType.CONFUSION_MATRIX} or {MetricType.MULTILABEL_CONFUSION_MATRIX}'
+      )
+
+    p = tp / (tp + fp + 1e-8)
+    r = tp / (tp + fn + 1e-8)
+    support = tp + fn
+    support_prob = support / support.sum()
+
+    f1 = 2 * p * r / (p + r + 1e-8)
+    f1_macro = f1.mean()
+    f1_micro = 2 * tp.sum() / (2 * tp.sum() + fp.sum() + fn.sum() + 1e-8)
+    f1_weighted = (f1 * support_prob).sum()
+
+    p_macro = p.mean()
+    p_weighted = (p * support_prob).sum()
+
+    r_macro = r.mean()
+    r_weighted = (r * support_prob).sum()
+
+    self._result = {
+        'f1@macro': f1_macro.item(),
+        'f1@micro': f1_micro.item(),
+        'f1@weighted': f1_weighted.item(),
+        'precision@macro': p_macro.item(),
+        'precision@weighted': p_weighted.item(),
+        'recall@macro': r_macro.item(),
+        'recall@weighted': r_weighted.item(),
+    }
+
+  @property
+  def dict(self) -> Dict[str, float]:
+    return self._result
+
+  @property
+  def accuracy(self) -> float:
+    return self._result['f1@micro']
+
+  def __repr__(self):
+    lines = ['**** Confusion Matrix Result ****']
+    lines.extend(
+        [f'** {key}: {value:.4f} **' for key, value in self.dict.items()]
+    )
+    lines.append('*******************************\n')
+    return '\n'.join(lines)
 
 
 class ImageNetReaLAccuracy(Metric):

@@ -21,6 +21,7 @@ from prot.eval.metrics import MetricType, build_metric
 from prot.eval.setup import setup_and_build_model
 from prot.eval.setup import get_args_parser as get_setup_args_parser
 from prot.eval.utils import ModelWithIntermediateLayers, evaluate
+from prot.eval.metrics import ConfusionMatrixResult
 from prot.utils import wandb
 
 logger = logging.getLogger('prot')
@@ -275,7 +276,10 @@ def evaluate_linear_classifiers(
 
   num_classes = len(class_mapping) if class_mapping is not None else training_num_classes
   metric = build_metric(metric_type, num_classes=num_classes)
-  postprocessors = {k: LinearPostprocessor(v, class_mapping, multilabel) for k, v in linear_classifiers.classifiers_dict.items()}
+  postprocessors = {
+      k: LinearPostprocessor(v, class_mapping, multilabel)
+      for k, v in linear_classifiers.classifiers_dict.items()
+  }
   metrics = {k: metric.clone() for k in linear_classifiers.classifiers_dict}
 
   _, results_dict_temp = evaluate(
@@ -289,40 +293,18 @@ def evaluate_linear_classifiers(
   results_dict = {}
   max_accuracy = 0
   best_classifier = ''
+  additional_dict = None
 
   for i, (classifier_string, metric) in enumerate(results_dict_temp.items()):
     if metric_type in (MetricType.CONFUSION_MATRIX, MetricType.MULTILABEL_CONFUSION_MATRIX):
-      logger.info(f'{prefixstring} -- Classifier: {classifier_string}')
-      matrix = metric['cm']
-      if metric_type == MetricType.CONFUSION_MATRIX:
-        tp = torch.diag(matrix)
-        fp = matrix.sum(dim=0) - tp
-        fn = matrix.sum(dim=1) - tp
-      elif MetricType.MULTILABEL_CONFUSION_MATRIX:
-        tp = matrix[:, 1, 1]
-        fp = matrix[:, 0, 1]
-        fn = matrix[:, 1, 0]
-      p = tp / (tp + fp + 1e-8)
-      r = tp / (tp + fn + 1e-8)
-      f1 = 2 * (p * r) / (p + r + 1e-8)
-      f1_micro = 2 * torch.sum(tp) / (
-          2 * torch.sum(tp) + torch.sum(fp) + torch.sum(fn) + 1e-8)
-      support = tp + fn
-      support_prob = support / torch.sum(support)
-      logger.info(f'**** Test Confusion Matrix ****')
-      logger.info(f'** f1-score@macro: {f1.mean()}')
-      logger.info(f'** f1-score@micro: {f1_micro}')
-      logger.info(f'** f1-score@weighted: {torch.sum(f1 * support_prob)}')
-      logger.info(f'** precision@macro: {torch.mean(p)}')
-      logger.info(f'** precision@weighted: {torch.sum(p * support_prob)}')
-      logger.info(f'** recall@macro: {torch.mean(r)}')
-      logger.info(f'** recall@weighted: {torch.sum(r * support_prob)}')
-      logger.info(f'*******************************')
+      metric = ConfusionMatrixResult(metric_type, metric['cm'])
+      logger.info(f'{prefixstring} -- Classifier: {classifier_string}\n{metric}')
       if (
-          best_classifier_on_val is None and f1_micro.item() > max_accuracy
+          best_classifier_on_val is None and metric.accuracy > max_accuracy
       ) or classifier_string == best_classifier_on_val:
-        max_accuracy = f1_micro.item()
+        max_accuracy = metric.accuracy
         best_classifier = classifier_string
+        additional_dict = metric.dict
     else:
       logger.info(f"{prefixstring} -- Classifier: {classifier_string} * {metric}")
       if (
@@ -335,6 +317,8 @@ def evaluate_linear_classifiers(
       'name': best_classifier,
       'accuracy': max_accuracy,
   }
+  if additional_dict is not None:
+    results_dict['best_classifier'].update(additional_dict)
   logger.info(f'best classifier: {results_dict["best_classifier"]}')
 
   if distributed.is_main_process():
@@ -382,20 +366,15 @@ def eval_linear(
       max_iter,
       start_iter,
   ):
+    loss_fn = nn.BCEWithLogitsLoss() if multilabel else nn.CrossEntropyLoss()
     data = data.cuda(non_blocking=True)
     labels = labels.cuda(non_blocking=True)
     features = feature_model(data)
     outputs = linear_classifiers(features)
-    if multilabel:
-      losses = {
-          f'loss_{k}': nn.BCEWithLogitsLoss()(v, labels)
-          for k, v in outputs.items()
-      }
-    else:
-      losses = {
-          f'loss_{k}': nn.CrossEntropyLoss()(v, labels)
-          for k, v in outputs.items()
-      }
+    losses = {
+        f'loss_{k}': loss_fn(v, labels)
+        for k, v in outputs.items()
+    }
     loss = sum(losses.values())
 
     # compute the gradients and update the optimizer
@@ -419,6 +398,7 @@ def eval_linear(
     periodic_checkpointer.step(iteration)
 
     if eval_period > 0 and (iteration + 1) % eval_period == 0 and iteration != max_iter - 1:
+      torch.cuda.synchronize()
       _ = evaluate_linear_classifiers(
           feature_model=feature_model,
           linear_classifiers=remove_ddp_wrapper(linear_classifiers),

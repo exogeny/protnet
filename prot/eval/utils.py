@@ -69,4 +69,6 @@ def evaluate(
   logger.info(f'Average stats: {metric_logger}')
   stats = {k: metric.compute() for k, metric in metrics.items()}
   metric_logger_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+  for metric in metrics.values():
+    metric.to('cpu').reset() # Move metrics to CPU to free GPU memory
   return metric_logger_stats, stats
