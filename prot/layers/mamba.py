@@ -95,11 +95,13 @@ class Mamba(nn.Module):
 
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias)
 
-    def forward(self, hidden_states, inference_params=None):
+    def forward(self, hidden_states, inference_params=None, seq_idx=None):
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
         """
+        if seq_idx is not None:
+           raise RuntimeError('Mamba1 doesn\'t support the varlen sequences.')
         batch, seqlen, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None

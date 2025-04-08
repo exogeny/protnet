@@ -70,8 +70,8 @@ def create_block(
   else:
     ffn_layer = nn.Identity
 
-  if block_name in ['mamba', 'mamba2']:
-    if block_name == 'mamba':
+  if block_name in ['mamba1', 'mamba2']:
+    if block_name == 'mamba1':
       mixer_cls = partial(
           Mamba,
           d_state=16,
@@ -644,11 +644,11 @@ def prot_mamba_small(patch_size=16, num_register_tokens=0, **kwargs):
   return model
 
 
-def prot_mamba_base(patch_size=16, num_register_tokens=0, **kwargs):
+def prot_mamba_base(patch_size=4, num_register_tokens=0, **kwargs):
   model = ProtNet(
-      block_name='mamba2',
+      block_name='mamba1',
       patch_size=patch_size,
-      embed_dim=768,
+      embed_dim=96,
       depth=12,
       num_heads=12,
       bias=False,

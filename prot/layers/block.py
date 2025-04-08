@@ -9,7 +9,7 @@ from prot.layers import MemEffAttention
 from prot.layers import DropPath
 from prot.layers import LayerScale
 from prot.layers import Mlp
-from prot.ops._triton.layer_norm import RMSNorm, rms_norm_fn, layer_norm_fn
+from prot.layers import Mamba2
 
 # References:
 #   https://github.com/facebookresearch/dino/blob/master/vision_transformer.py
@@ -286,15 +286,7 @@ class MambaBlock(nn.Module):
     self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
     self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
     self.sample_drop_ratio = drop_path
-
-  def auto_reshape(self, seq_idx: Tensor) -> Tensor:
-    if seq_idx.shape[0] == 1:
-      r = int(math.sqrt(seq_idx.shape[1]))
-      for i in range(r, r // 4, -1):
-        if seq_idx.shape[1] % i == 0:
-          seq_idx = seq_idx.reshape((i, -1))
-          break
-    return seq_idx
+    self.support_varlen_seq = isinstance(self.mixer, Mamba2)
 
   def split_and_cat_mixer(self, x: Tensor, seq_idx: Optional[Tensor] = None) -> Tensor:
     x = torch.tensor_split(x, 2, dim=-1)
@@ -305,7 +297,7 @@ class MambaBlock(nn.Module):
     return x.contiguous()
 
   def forward_nested(self, x_list):
-    if self.training and self.sample_drop_ratio > 0.0:
+    if self.training and self.sample_drop_ratio > 0.0 and self.support_varlen_seq:
       def attn_residual_func(x: Tensor, seq_idx=None) -> Tensor:
         return self.split_and_cat_mixer(self.norm1(x), seq_idx=seq_idx)
 
@@ -333,10 +325,14 @@ class MambaBlock(nn.Module):
       def ffn_residual_func(x: Tensor) -> Tensor:
           return self.ls2(self.mlp(self.norm2(x)))
 
-      (attn_bias, seq_idx), x = get_attn_bias_and_cat(x_list, have_seq_idx=True)
-      x = x + attn_residual_func(x, seq_idx=seq_idx)
-      x = x + ffn_residual_func(x)
-      x = attn_bias.split(x)
+      if self.support_varlen_seq:
+        (attn_bias, seq_idx), x = get_attn_bias_and_cat(x_list, have_seq_idx=True)
+        x = x + attn_residual_func(x, seq_idx=seq_idx)
+        x = x + ffn_residual_func(x)
+        x = attn_bias.split(x)
+      else:
+        x = [x + attn_residual_func(x) for x in x_list]
+        x = [x + ffn_residual_func(x) for x in x_list]
       return x
 
   def forward(self, x: Tensor) -> Tensor:
@@ -349,7 +345,7 @@ class MambaBlock(nn.Module):
     def ffn_residual_func(x: Tensor) -> Tensor:
       return self.ls2(self.mlp(self.norm2(x)))
 
-    if self.training and self.sample_drop_ratio > 0.1:
+    if self.training and self.sample_drop_ratio > 0.1 and self.support_varlen_seq:
       # the overhead is compensated only for a drop path rate larger than 0.1
       x = drop_add_residual_stochastic_depth(
           x,
