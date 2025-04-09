@@ -1,16 +1,18 @@
-# this corresponds to the default config
 train:
-  dataset_path: Pods:split=train:root=/mnt/data2/human_protein_atlas/Custom
-  batch_size_per_gpu: 16
-  cache_dataset: true
+  dataset_path: Pods:root=/mnt/data1/tensorflow_datasets/extracted/human_protein_atlas/Custom:split=train
+  batch_size_per_gpu: 28
   output_dir: train_dir/proteinnet/baseline
 optim:
-  layerwise_decay: 1.0
+  layerwise_decay: 0.9
 student:
   arch: prot_mamba_base
+  patch_size: 8
   ffn_layer: "GatedMlp"
+  mlp_ratio: 0.0
+  layerscale: 1.0
 dino:
-  head_mlp_bias: false
-  koleo_loss_weight: 0.1
-ibot:
+  head_n_prototypes: 4096
+  head_bottleneck_dim: 256
+  head_nlayers: 3
+  head_hidden_dim: 2048
   head_mlp_bias: false

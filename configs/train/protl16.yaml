@@ -1,10 +1,10 @@
 # this corresponds to the default config
 train:
   dataset_path: Pods:root=/mnt/data1/tensorflow_datasets/extracted/human_protein_atlas/Custom:split=train
-  batch_size_per_gpu: 64
-  output_dir: train_dir/dinov2_vitb16
-  generation: false
-  reconstruction: false
+  batch_size_per_gpu: 8
+  cache_dataset: true
+  output_dir: train_dir/proteinnet/baseline
 student:
-  arch: vit_base
+  arch: prot_large
   ffn_layer: mlp
+  mlp_ratio: 4.
