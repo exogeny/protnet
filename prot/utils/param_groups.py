@@ -29,8 +29,8 @@ def get_vit_lr_decay_rate(
         or '.mask_token' in name
         or '.cls_token' in name
         or '.register_tokens' in name
-        or 'decoder_embed' in name
-        or 'integrater_embed' in name
+        or '.decoder_embed' in name
+        or '.integrater_embed' in name
     ):
       layer_id = 0
     elif force_is_backbone and (
@@ -43,6 +43,8 @@ def get_vit_lr_decay_rate(
         or 'integrater_embed' in name
     ):
       layer_id = 0
+    elif 'integrater' in name or 'decoder' in name:
+      layer_id = num_layers + 1
     elif '.blocks.' in name and '.residual.' not in name:
       layer_id = int(name[name.find('.blocks.') :].split('.')[2]) + 1
     elif chunked_blocks and 'blocks.' in name and 'residual.' not in name:

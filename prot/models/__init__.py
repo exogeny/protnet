@@ -31,6 +31,7 @@ def build_model(args, only_teacher=False, img_size=224):
         vit_kwargs = dict(
             img_size=img_size,
             patch_size=args.patch_size,
+            mlp_ratio=args.mlp_ratio,
             init_values=args.layerscale,
             ffn_layer=args.ffn_layer,
             block_chunks=args.block_chunks,

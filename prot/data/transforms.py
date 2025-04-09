@@ -2,6 +2,7 @@ from typing import Sequence
 
 import torch
 from torchvision import transforms
+from torchvision.transforms import _functional_pil as _FP
 
 
 class GaussianBlur(transforms.RandomApply):
@@ -15,6 +16,19 @@ class GaussianBlur(transforms.RandomApply):
     transform = transforms.GaussianBlur(kernel_size=9, sigma=(radius_min, radius_max))
     super().__init__(transforms=[transform], p=keep_p)
 
+
+class RandomAffine:
+  def __init__(self, offset):
+    self._offset = offset
+
+  def __call__(self, pic):
+    m1 = (torch.rand(2, 2) * 1.2 - 0.6) * (1 - torch.eye(2))
+    m2 = (torch.rand(2, 2) * 2.7 + 0.3) * torch.eye(2)
+    matrix = torch.linalg.inv(m1 + m2)
+    trans = torch.rand(1, 2) * self._offset - self._offset / 2
+    matrix = torch.cat([matrix, trans], dim=0).permute(1, 0)
+    matrix = matrix.flatten().tolist()
+    return _FP.affine(pic, matrix=matrix)
 
 class MaybeToTensor(transforms.ToTensor):
   """
@@ -41,15 +55,6 @@ def make_normalize_transform(
     mean: Sequence[float] = DEFAULT_MEAN,
     std: Sequence[float] = DEFAULT_STD,
 ) -> transforms.Normalize:
-  return transforms.Normalize(mean=mean, std=std)
-
-
-def revert_normalize_transform(
-    mean: Sequence[float] = DEFAULT_MEAN,
-    std: Sequence[float] = DEFAULT_STD,
-) -> transforms.Normalize:
-  mean = [-m / s for m, s in zip(mean, std)]
-  std = [1 / s for s in std]
   return transforms.Normalize(mean=mean, std=std)
 
 

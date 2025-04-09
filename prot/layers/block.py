@@ -1,5 +1,4 @@
 from typing import Callable, List, Any, Tuple, Dict, Optional
-import math
 import torch
 from torch import nn, Tensor
 from xformers.ops import fmha, scaled_index_add, index_select_cat
@@ -280,20 +279,27 @@ class MambaBlock(nn.Module):
     self.norm1 = norm_cls(dim)
     self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
     self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-    self.mixer = mixer_cls(dim // 2)
-    self.norm2 = norm_cls(dim) if mlp_cls is not nn.Identity else nn.Identity()
-    self.mlp = mlp_cls(dim) if mlp_cls is not nn.Identity else nn.Identity()
-    self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
-    self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+    self.mixer = mixer_cls(dim)
+    if mlp_cls is not nn.Identity:
+      self.norm2 = norm_cls(dim)
+      self.mlp = mlp_cls(dim)
+      self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+      self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+    else:
+      self.norm2 = None
+      self.mlp = None
+      self.ls2 = None
+      self.drop_path2 = None
     self.sample_drop_ratio = drop_path
     self.support_varlen_seq = isinstance(self.mixer, Mamba2)
 
   def split_and_cat_mixer(self, x: Tensor, seq_idx: Optional[Tensor] = None) -> Tensor:
-    x = torch.tensor_split(x, 2, dim=-1)
-    x = torch.cat([x[0], x[1].flip([1])], dim=1)
+    x = torch.cat([x, x.flip([1])], dim=1)
+    if seq_idx is not None:
+      seq_idx = torch.cat([seq_idx, seq_idx.flip([1])], dim=1)
     x = self.mixer(x, seq_idx=seq_idx)
     x = torch.tensor_split(x, 2, dim=1)
-    x = torch.cat([x[0], x[1].flip([1])], dim=-1)
+    x = x[0] + x[1].flip([1])
     return x.contiguous()
 
   def forward_nested(self, x_list):
@@ -311,12 +317,13 @@ class MambaBlock(nn.Module):
           sample_drop_ratio=self.sample_drop_ratio,
           scaling_vector=self.ls1.gamma if isinstance(self.ls1, LayerScale) else None,
       )
-      x_list = drop_add_residual_stochastic_depth_list(
-          x_list,
-          residual_func=ffn_residual_func,
-          sample_drop_ratio=self.sample_drop_ratio,
-          scaling_vector=self.ls2.gamma if isinstance(self.ls1, LayerScale) else None,
-      )
+      if self.mlp is not None:
+        x_list = drop_add_residual_stochastic_depth_list(
+            x_list,
+            residual_func=ffn_residual_func,
+            sample_drop_ratio=self.sample_drop_ratio,
+            scaling_vector=self.ls2.gamma if isinstance(self.ls1, LayerScale) else None,
+        )
       return x_list
     else:
       def attn_residual_func(x: Tensor, seq_idx=None) -> Tensor:
@@ -328,11 +335,13 @@ class MambaBlock(nn.Module):
       if self.support_varlen_seq:
         (attn_bias, seq_idx), x = get_attn_bias_and_cat(x_list, have_seq_idx=True)
         x = x + attn_residual_func(x, seq_idx=seq_idx)
-        x = x + ffn_residual_func(x)
+        if self.mlp is not None:
+          x = x + ffn_residual_func(x)
         x = attn_bias.split(x)
       else:
         x = [x + attn_residual_func(x) for x in x_list]
-        x = [x + ffn_residual_func(x) for x in x_list]
+        if self.mlp is not None:
+          x = [x + ffn_residual_func(x) for x in x_list]
       return x
 
   def forward(self, x: Tensor) -> Tensor:
@@ -352,15 +361,18 @@ class MambaBlock(nn.Module):
           residual_func=attn_residual_func,
           sample_drop_ratio=self.sample_drop_ratio,
       )
-      x = drop_add_residual_stochastic_depth(
-          x,
-          residual_func=ffn_residual_func,
-          sample_drop_ratio=self.sample_drop_ratio,
-      )
+      if self.mlp is not None:
+        x = drop_add_residual_stochastic_depth(
+            x,
+            residual_func=ffn_residual_func,
+            sample_drop_ratio=self.sample_drop_ratio,
+        )
     elif self.training and self.sample_drop_ratio > 0.0:
       x = x + self.drop_path1(attn_residual_func(x))
-      x = x + self.drop_path2(ffn_residual_func(x))
+      if self.mlp is not None:
+        x = x + self.drop_path2(ffn_residual_func(x))
     else:
       x = x + attn_residual_func(x)
-      x = x + ffn_residual_func(x)
+      if self.mlp is not None:
+        x = x + ffn_residual_func(x)
     return x

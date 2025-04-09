@@ -126,14 +126,18 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
 
 
 def do_test(cfg, model, iteration):
-  new_state_dict = model.teacher.state_dict()
+  teacher_state_dict = model.teacher.state_dict()
+  student_state_dict = model.student.state_dict()
   if distributed.is_main_process():
     iterstring = str(iteration)
     eval_dir = os.path.join(cfg.train.output_dir, 'eval', iterstring)
     os.makedirs(eval_dir, exist_ok=True)
     # save teacher checkpoint
     teacher_ckp_path = os.path.join(eval_dir, 'teacher_checkpoint.pth')
-    torch.save({'teacher': new_state_dict}, teacher_ckp_path)
+    torch.save({
+        'teacher': teacher_state_dict,
+        'student': student_state_dict,
+    }, teacher_ckp_path)
 
 
 def do_train(cfg, model, resume=False):
@@ -194,7 +198,7 @@ def do_train(cfg, model, resume=False):
       batch_size=cfg.train.batch_size_per_gpu,
       num_workers=cfg.train.num_workers,
       shuffle=True,
-      seed=start_iter,
+      seed=start_iter + 42,
       sampler_type=sampler_type,
       sampler_advance=0,
       drop_last=True,

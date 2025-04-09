@@ -2,7 +2,10 @@ import logging
 import numpy as np
 from PIL import Image
 from torchvision import transforms
-from prot.data.transforms import GaussianBlur, make_normalize_transform
+from prot.data.transforms import MaybeToTensor
+from prot.data.transforms import GaussianBlur
+from prot.data.transforms import RandomAffine
+from prot.data.transforms import make_normalize_transform
 
 
 logger = logging.getLogger('prot')
@@ -70,9 +73,9 @@ class DataAugmentationDINO(object):
             transforms.RandomAffine(
                 degrees=45,
                 translate=(0.2, 0.2),
-                scale=(0.6, 1.4),
+                scale=(0.3, 3.0),
             ),
-            transforms.RandomSolarize(threshold=128, p=0.2),
+            # RandomAffine(global_crops_size // 2),
         ]
     )
 
@@ -81,13 +84,13 @@ class DataAugmentationDINO(object):
     # normalization
     self.normalize = transforms.Compose(
         [
-            transforms.ToTensor(),
+            MaybeToTensor(),
             make_normalize_transform(),
         ]
     )
 
-    self.global_transfo1 = transforms.Compose([color_jittering, global_transfo1_extra, self.normalize])
-    self.global_transfo2 = transforms.Compose([color_jittering, global_transfo2_extra, self.normalize])
+    self.global_transfo1 = transforms.Compose([color_jittering, global_transfo1_extra, MaybeToTensor()])
+    self.global_transfo2 = transforms.Compose([color_jittering, global_transfo2_extra, MaybeToTensor()])
     self.local_transfo = transforms.Compose([color_jittering, local_transfo_extra, self.normalize])
 
   def __call__(self, image: Image.Image):
@@ -101,9 +104,10 @@ class DataAugmentationDINO(object):
     global_crop_2 = self.global_transfo2(im2_base)
 
     output['global_crops'] = [global_crop_1, global_crop_2]
-
-    # global crops for teacher:
-    output['global_crops_teacher'] = [global_crop_1, global_crop_2]
+    output['global_crops_normailized'] = [
+        self.normalize(global_crop_1),
+        self.normalize(global_crop_2),
+    ]
 
     # local crops:
     local_crops = [

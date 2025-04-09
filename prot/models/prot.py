@@ -306,7 +306,7 @@ class ProtNet(nn.Module):
     nn.init.normal_(self.cls_token, std=1e-6)
     if self.register_tokens is not None:
         nn.init.normal_(self.register_tokens, std=1e-6)
-    if self.block_name in ['mamba', 'mamba2']:
+    if self.block_name in ['mamba1', 'mamba2']:
         named_apply(partial(
             init_weights_ssm,
             n_blocks=self.n_blocks,
@@ -315,6 +315,16 @@ class ProtNet(nn.Module):
         self)
     else:
       named_apply(init_weights_vit_timm, self)
+
+  def unpatchify(self, patch_tokens):
+    B, N, C = patch_tokens.shape
+    h = w = int(N**.5)
+    p = self.patch_size
+    c = C // (p * p)
+    x = patch_tokens.reshape(shape=(B, h, w, p, p, c))
+    x = torch.einsum('nhwpqc->nchpwq', x)
+    imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+    return imgs
 
   def interpolate_pos_encoding(self, x, w, h, pos_embed, has_cls_token=True):
     previous_dtype = x.dtype
@@ -356,14 +366,32 @@ class ProtNet(nn.Module):
 
   def apply_feature_fusion(self, p, c):
     if isinstance(p, list):
-      return [self.apply_feature_fusion(pi, ci) for pi, ci in zip(p, c)]
+      shapes = [x.shape for x in p]
+      cls_token = [x[:, :1] for x in p]
+      patch_token = [x[:, 1:].flatten(0, 1) for x in p]
+      patch_token = torch.cat(patch_token, dim=0).unsqueeze(0)
+      c = torch.cat([x.flatten(0, 1) for x in c], dim=0).unsqueeze(0)
+    else:
+      cls_token, patch_token = torch.tensor_split(p, [1], dim=1)
     # split the pos_token into c and p
-    cls_token, patch_token = torch.tensor_split(p, [1], dim=1)
     p_of_c, p_of_p = torch.tensor_split(patch_token, [self.contour_embed_dim], dim=2)
-    p_of_c = 0.5 * (p_of_c + c)
+    # fusion the c into p_of_c
+    # p_of_c = 0.5 * (p_of_c + c)
+    ratio = torch.tanh(torch.mean(p_of_p, dim=2, keepdim=True))
+    p_of_c = p_of_c + ratio * c
+    p_of_c_mean = torch.mean(p_of_c, dim=2, keepdim=True)
+    p_of_p = p_of_p - ratio * p_of_c_mean
     pos_token = torch.cat([p_of_c, p_of_p], dim=-1)
     # get the final p and c
-    p = torch.cat([cls_token, pos_token], dim=1)
+    if isinstance(p, list):
+      l = [s[0] * (s[1] - 1) for s in shapes[:-1]]
+      patch_token = torch.tensor_split(pos_token.squeeze(0), l, dim=0)
+      p = [
+          torch.cat([cls, p.view(s[0], s[1] -1, s[2])], dim=1).contiguous()
+          for cls, p, s in zip(cls_token, patch_token, shapes)
+      ]
+    else:
+      p = torch.cat([cls_token, pos_token], dim=1).contiguous()
     return p
 
   def encode(self, px, cx):
@@ -532,14 +560,14 @@ class ProtNet(nn.Module):
       reshape: bool = False,
       return_class_token: bool = False,
       norm: bool = True,
-      contain_integrated_feature: bool = True,
+      contain_integrated_feature: bool = False,
   ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
     if self.chunked_blocks:
       outputs = self._get_intermediate_layers_chunked(x, n, norm, contain_integrated_feature)
     else:
       outputs = self._get_intermediate_layers_not_chunked(x, n, norm, contain_integrated_feature)
     class_tokens = [out[:, 0] for out in outputs]
-    outputs = [out[:, 1+self.num_register_tokens:] for out in outputs]
+    outputs = [out[:, 1+self.num_register_tokens:, self.contour_embed_dim:] for out in outputs]
     if reshape:
       B, _, w, h = x.shape
       outputs = [
@@ -550,21 +578,30 @@ class ProtNet(nn.Module):
       return tuple(zip(outputs, class_tokens))
     return tuple(outputs)
 
-  def generate(self, output, contours=None, **_):
+  def generate_from_output(self, output, contours=None, **_):
     if isinstance(contours, list) and any([c is not None for c in contours]):
-      return [self.generate(o, c) for o, c in zip(output, contours)]
+      return [self.generate_from_output(o, c) for o, c in zip(output, contours)]
     elif isinstance(contours, Tensor): # treat the output and contours as tensor
       feature = output['x_norm']
       target_feature = self.integrate(feature, contours)
       reconstruction = self.decode(feature)
       generation = self.decode(target_feature)
-      output['generation'] = generation
-      output['reconstruction'] = reconstruction
+      output['generation'] = self.unpatchify(generation)
+      output['reconstruction'] = self.unpatchify(reconstruction)
     return output
+
+  def generate(self, image, contour):
+    px, cx = self.prepare_tokens_with_masks(image)
+    px = self.encode(px, cx)
+    px = self.encoder_norm(px)
+    px = self.integrate(px, contour)
+    px = self.decode(px)
+    image = self.unpatchify(px)
+    return image
 
   def forward(self, *args, **kwargs):
     output = self.forward_features(*args, **kwargs)
-    output = self.generate(output, **kwargs)
+    output = self.generate_from_output(output, **kwargs)
     return output
 
 

@@ -13,8 +13,6 @@ from prot.layers import BlockChunk, DINOHead
 from prot.utils.utils import has_batchnorms
 from prot.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
 from prot.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
-from prot.data.transforms import revert_normalize_transform
-
 
 
 logger = logging.getLogger('prot')
@@ -118,21 +116,9 @@ class SSLMetaArch(nn.Module):
     logger.info(f'Student and Teacher are built: they are both {cfg.student.arch} network.')
     # calcuate the SSIM metrics
     self._ssim = StructuralSimilarityIndexMeasure(data_range=1.0)
-    self._revert_normalize_fn = revert_normalize_transform()
 
   def ssim(self, x, y):
-    x = self._revert_normalize_fn(x)[:, :1]
-    y = self._revert_normalize_fn(y)[:, :1]
-    return self._ssim(x, y)
-
-  def unpatchify(self, x):
-    h = w = int(x.shape[1]**.5)
-    assert h * w == x.shape[1]
-    p = int((math.prod(x.shape[1:]) / 3 // (h * w))**.5)
-    x = x.reshape(shape=(x.shape[0], h, w, p, p, 3))
-    x = torch.einsum('nhwpqc->nchpwq', x)
-    imgs = x.reshape(shape=(x.shape[0], 3, h * p, h * p))
-    return imgs
+    return self._ssim(x[:, :1], y[:, :1])
 
   def forward(self, inputs):
     raise NotImplementedError
@@ -149,6 +135,7 @@ class SSLMetaArch(nn.Module):
     n_local_crops = self.cfg.crops.local_crops_number
 
     global_crops = images['collated_global_crops'].cuda(non_blocking=True)
+    global_crops_normed = images['collated_global_crops_normed'].cuda(non_blocking=True)
     local_crops = images['collated_local_crops'].cuda(non_blocking=True)
 
     masks = images['collated_masks'].cuda(non_blocking=True)
@@ -170,7 +157,7 @@ class SSLMetaArch(nn.Module):
     # teacher output
     @torch.no_grad()
     def get_teacher_output():
-      x, n_global_crops_teacher = global_crops, n_global_crops
+      x, n_global_crops_teacher = global_crops_normed, n_global_crops
       teacher_backbone_output_dict = self.teacher.backbone(x, is_training=True)
       teacher_cls_tokens = teacher_backbone_output_dict['x_norm_clstoken']
       teacher_cls_tokens = teacher_cls_tokens.chunk(n_global_crops_teacher)
@@ -243,30 +230,34 @@ class SSLMetaArch(nn.Module):
     loss_dict = {}
     loss_accumulator = 0  # for backprop
     # reverse the order of the global crops for generation
+    # we generate the image with range [0, 1] with global_crops
     images = global_crops.chunk(n_global_crops, dim=0)
     images = torch.cat([images[1], images[0]], dim=0)
-    contours = global_crops[:, 1:].chunk(n_global_crops, dim=0)
+    contours = global_crops_normed[:, 1:].chunk(n_global_crops, dim=0)
     contours = torch.cat([contours[1], contours[0]], dim=0)
     student_global_backbone_output_dict, student_local_backbone_output_dict = self.student.backbone(
-        [global_crops, local_crops],
+        [global_crops_normed, local_crops],
         masks=[masks, None],
         contours=[contours, None],
         is_training=True
     )
 
-    # first, we perform the reconstruction and generation mse loss
+    # 0: perform the reconstruction and generation mse loss
+    if self.cfg.train.reconstruction or self.cfg.train.generation:
+      B, _, H, W = global_crops.shape
+      mse_weight = torch.tensor([10, 1, 1], dtype=global_crops.dtype, device=global_crops.device)
+      mse_weight = mse_weight / mse_weight.sum()
+      mse_weight = mse_weight.view(1, 3, 1, 1).repeat((B, 1, H, W))
     if self.cfg.train.reconstruction:
       reconstruction = student_global_backbone_output_dict['reconstruction']
-      reconstruction = self.unpatchify(reconstruction)
-      reconstruction_loss = nn.functional.mse_loss(reconstruction, global_crops)
+      reconstruction_loss = nn.functional.mse_loss(reconstruction, global_crops, weight=mse_weight)
       loss_accumulator += reconstruction_loss
       loss_dict['reconstruction'] = reconstruction_loss
       loss_dict['ssim_r'] = self.ssim(reconstruction, global_crops)
 
     if self.cfg.train.generation:
       generation = student_global_backbone_output_dict['generation']
-      generation = self.unpatchify(generation)
-      generation_loss = nn.functional.mse_loss(generation, images)
+      generation_loss = nn.functional.mse_loss(generation, images, weight=mse_weight)
       loss_accumulator += generation_loss
       loss_dict['generation'] = generation_loss
       loss_dict['ssim_g'] = self.ssim(generation, images)
