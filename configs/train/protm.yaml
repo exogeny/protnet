@@ -7,6 +7,8 @@ optim:
 student:
   arch: prot_mamba_base
   patch_size: 8
+  mlp_ratio: 0
+  layerscale: 1.0
   ffn_layer: "GatedMlp"
   mlp_ratio: 0.0
   layerscale: 1.0
@@ -15,4 +17,6 @@ dino:
   head_bottleneck_dim: 256
   head_nlayers: 3
   head_hidden_dim: 2048
+  head_mlp_bias: false
+ibot:
   head_mlp_bias: false

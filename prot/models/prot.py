@@ -169,6 +169,8 @@ class ProtNet(nn.Module):
       num_register_tokens=0,
       interpolate_antialias=False,
       interpolate_offset=0.1,
+      reconstruction_mode=True,
+      generation_mode=True,
   ):
     """
     Args:
@@ -197,6 +199,9 @@ class ProtNet(nn.Module):
     """
     super().__init__()
     self.block_name = block_name
+
+    self.reconstruction_mode = reconstruction_mode
+    self.generation_mode = generation_mode
 
     self.contour_embed_dim = int(embed_dim * contour_ratio)
     self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
@@ -271,30 +276,32 @@ class ProtNet(nn.Module):
     )
     self.encoder_norm = norm_layer(embed_dim)
 
-    # intergrater
-    self.integrater_embed = nn.Linear(embed_dim, embed_dim, bias=bias)
-    self.integrater_blocks = create_blocks(
-        block_chunks,
-        depth,
-        dim=embed_dim,
-        num_heads=num_heads,
-        drop_paths=dpr,
-        **common_block_kwargs,
-    )
-    self.integrater_norm = norm_layer(embed_dim)
+    if generation_mode:
+      # intergrater
+      self.integrater_embed = nn.Linear(embed_dim, embed_dim, bias=bias)
+      self.integrater_blocks = create_blocks(
+          block_chunks,
+          depth,
+          dim=embed_dim,
+          num_heads=num_heads,
+          drop_paths=dpr,
+          **common_block_kwargs,
+      )
+      self.integrater_norm = norm_layer(embed_dim)
 
-    # decoder
-    self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=bias)
-    self.decoder_norm = norm_layer(decoder_embed_dim)
-    self.decoder_blocks = create_blocks(
-        block_chunks,
-        decoder_depth,
-        dim=decoder_embed_dim,
-        num_heads=decoder_num_heads,
-        drop_paths=dpr_decoder,
-        **common_block_kwargs,
-    )
-    self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * 3, bias=bias)
+    if reconstruction_mode or generation_mode:
+      # decoder
+      self.decoder_embed = nn.Linear(embed_dim, decoder_embed_dim, bias=bias)
+      self.decoder_norm = norm_layer(decoder_embed_dim)
+      self.decoder_blocks = create_blocks(
+          block_chunks,
+          decoder_depth,
+          dim=decoder_embed_dim,
+          num_heads=decoder_num_heads,
+          drop_paths=dpr_decoder,
+          **common_block_kwargs,
+      )
+      self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * 3, bias=bias)
 
     self.protein_mask_token = nn.Parameter(torch.zeros(1, embed_dim))
     self.contour_mask_token = nn.Parameter(torch.zeros(1, self.contour_embed_dim))
@@ -583,11 +590,12 @@ class ProtNet(nn.Module):
       return [self.generate_from_output(o, c) for o, c in zip(output, contours)]
     elif isinstance(contours, Tensor): # treat the output and contours as tensor
       feature = output['x_norm']
-      target_feature = self.integrate(feature, contours)
       reconstruction = self.decode(feature)
-      generation = self.decode(target_feature)
-      output['generation'] = self.unpatchify(generation)
       output['reconstruction'] = self.unpatchify(reconstruction)
+      if self.generation_mode:
+        target_feature = self.integrate(feature, contours)
+        generation = self.decode(target_feature)
+        output['generation'] = self.unpatchify(generation)
     return output
 
   def generate(self, image, contour):
@@ -601,7 +609,8 @@ class ProtNet(nn.Module):
 
   def forward(self, *args, **kwargs):
     output = self.forward_features(*args, **kwargs)
-    output = self.generate_from_output(output, **kwargs)
+    if self.generation_mode or self.reconstruction_mode:
+      output = self.generate_from_output(output, **kwargs)
     return output
 
 

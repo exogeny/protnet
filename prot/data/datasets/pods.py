@@ -1,6 +1,7 @@
 from typing import Any, Callable, Optional
 import os
 import numpy as np
+from PIL import Image
 
 from torchvision.transforms import Compose
 from torchvision.datasets import ImageFolder
@@ -54,3 +55,30 @@ class PodsDataset(ImageFolder):
     if self._remapping:
       return np.array(range(13), dtype=np.int32)
     return np.array(self._targets, dtype=np.int32)
+
+
+class PodsGenerationDataset:
+  def __init__(self, root: str, transform: Optional[Callable] = None, **kwargs):
+    generations_filename = os.path.join(root, 'generations.txt')
+    if not os.path.exists(generations_filename):
+      raise RuntimeError(f"Generations file list [{generations_filename}] not found.")
+    with open(generations_filename, 'r') as f:
+      generations = f.readlines()
+    self.generations = []
+    for line in generations:
+      line = line.strip()
+      if len(line) > 0:
+        self.generations.append(line)
+    self.transform = transform
+
+  def __getitem__(self, index: int):
+    image1, image2 = self.generations[index].split(',')
+    image1 = Image.open(image1).convert(mode='RGB')
+    image2 = Image.open(image2).convert(mode='RGB')
+    if self.transform is not None:
+      image1 = self.transform(image1)
+      image2 = self.transform(image2)
+    return image1, image2
+
+  def __len__(self) -> int:
+    return len(self.generations)

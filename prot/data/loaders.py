@@ -5,7 +5,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from prot.data.datasets.pods import PodsDataset
+from prot.data.datasets.pods import PodsDataset, PodsGenerationDataset
 from prot.data.datasets import ImageNet, ImageNet22k
 from prot.data.samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
@@ -37,6 +37,8 @@ def _parse_dataset_str(dataset_str: str):
     class_ = ImageNet22k
   elif name == 'Pods':
     class_ = PodsDataset
+  elif name == 'PodsGeneration':
+    class_ = PodsGenerationDataset
   else:
     raise ValueError(f'Unsupported dataset [{name}]')
   return class_, kwargs
