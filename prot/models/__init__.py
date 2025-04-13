@@ -44,6 +44,7 @@ def build_model(
           qkv_bias=args.qkv_bias,
           proj_bias=args.proj_bias,
           ffn_bias=args.ffn_bias,
+          num_tokens=args.num_tokens,
           num_register_tokens=args.num_register_tokens,
           interpolate_offset=args.interpolate_offset,
           interpolate_antialias=args.interpolate_antialias,

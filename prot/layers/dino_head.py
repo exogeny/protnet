@@ -43,11 +43,11 @@ def _build_mlp(nlayers, in_dim, bottleneck_dim, hidden_dim=None, use_bn=False, b
     layers = [nn.Linear(in_dim, hidden_dim, bias=bias)]
     if use_bn:
       layers.append(nn.BatchNorm1d(hidden_dim))
-    layers.append(nn.GELU())
+    layers.append(nn.SiLU())
     for _ in range(nlayers - 2):
       layers.append(nn.Linear(hidden_dim, hidden_dim, bias=bias))
       if use_bn:
         layers.append(nn.BatchNorm1d(hidden_dim))
-      layers.append(nn.GELU())
+      layers.append(nn.SiLU())
     layers.append(nn.Linear(hidden_dim, bottleneck_dim, bias=bias))
     return nn.Sequential(*layers)

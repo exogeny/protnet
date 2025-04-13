@@ -45,6 +45,7 @@ class SSLMetaArch(nn.Module):
         )
       student_backbone.load_state_dict(state_dict, strict=False)
 
+    self.num_tokens = cfg.student.num_tokens
     self.embed_dim = embed_dim
     self.dino_out_dim = cfg.dino.head_n_prototypes
 
@@ -71,7 +72,7 @@ class SSLMetaArch(nn.Module):
           nlayers=cfg.dino.head_nlayers,
           mlp_bias=cfg.dino.head_mlp_bias,
       )
-      self.dino_loss = DINOLoss(self.dino_out_dim)
+      self.dino_loss = DINOLoss(self.dino_out_dim, self.num_tokens)
       if self.do_koleo:
         logger.info('OPTIONS -- DINO -- applying KOLEO regularization')
         self.koleo_loss = KoLeoLoss()
@@ -170,7 +171,8 @@ class SSLMetaArch(nn.Module):
       teacher_cls_tokens = teacher_backbone_output_dict['x_norm_clstoken']
       teacher_cls_tokens = teacher_cls_tokens.chunk(n_global_crops_teacher)
       # watch out: these are chunked and cat'd in reverse so A is matched to B in the global crops dino loss
-      teacher_cls_tokens = torch.cat((teacher_cls_tokens[1], teacher_cls_tokens[0]))
+      teacher_cls_tokens = torch.cat((teacher_cls_tokens[1], teacher_cls_tokens[0]), dim=0)
+      teacher_cls_tokens = teacher_cls_tokens.flatten(0, 1)
       ibot_teacher_patch_tokens = teacher_backbone_output_dict['x_norm_patchtokens']
       _dim = ibot_teacher_patch_tokens.shape[-1]
       n_cls_tokens = teacher_cls_tokens.shape[0]
@@ -205,6 +207,7 @@ class SSLMetaArch(nn.Module):
         teacher_cls_tokens_after_head = self.teacher.dino_head(teacher_cls_tokens)
         masked_teacher_ibot_softmaxed_centered = None
 
+      teacher_cls_tokens_after_head = teacher_cls_tokens_after_head.unflatten(0, (-1, self.num_tokens))
       if self.cfg.train.centering == 'centering':
         teacher_dino_softmaxed_centered_list = self.dino_loss.softmax_center_teacher(
             teacher_cls_tokens_after_head, teacher_temp=teacher_temp
@@ -274,10 +277,12 @@ class SSLMetaArch(nn.Module):
 
     # 1a: local crops cls tokens
     student_local_cls_tokens = student_local_backbone_output_dict['x_norm_clstoken']
+    student_local_cls_tokens = student_local_cls_tokens.flatten(0, 1)
     inputs_for_student_head_list.append(student_local_cls_tokens.unsqueeze(0))
 
     # 1b: global crops cls tokens
     student_global_cls_tokens = student_global_backbone_output_dict['x_norm_clstoken']
+    student_global_cls_tokens = student_global_cls_tokens.flatten(0, 1)
     inputs_for_student_head_list.append(student_global_cls_tokens.unsqueeze(0))
 
     # 1c: global crops patch tokens
@@ -300,10 +305,10 @@ class SSLMetaArch(nn.Module):
     outputs_list = _attn_bias.split(self.student.dino_head(cat_inputs))
 
     # 3a: local crops cls tokens
-    student_local_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
+    student_local_cls_tokens_after_head = outputs_list.pop(0).squeeze(0).unflatten(0, (-1, self.num_tokens))
 
     # 3b: global crops cls tokens
-    student_global_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
+    student_global_cls_tokens_after_head = outputs_list.pop(0).squeeze(0).unflatten(0, (-1, self.num_tokens))
 
     # 3c: global crops patch tokens
     if do_ibot and not self.ibot_separate_head:

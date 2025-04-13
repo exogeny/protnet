@@ -166,11 +166,12 @@ class ProtNet(nn.Module):
       ffn_layer='GatedMlp',
       norm_layer=partial(RMSNorm, eps=1e-5),
       block_chunks=0,
-      num_register_tokens=0,
-      interpolate_antialias=False,
-      interpolate_offset=0.1,
-      reconstruction_mode=True,
-      generation_mode=True,
+      num_tokens: int = 1,
+      num_register_tokens: int = 0,
+      interpolate_antialias: bool = False,
+      interpolate_offset: float = 0.1,
+      reconstruction_mode: bool = True,
+      generation_mode: bool = True,
   ):
     """
     Args:
@@ -205,7 +206,7 @@ class ProtNet(nn.Module):
 
     self.contour_embed_dim = int(embed_dim * contour_ratio)
     self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-    self.num_tokens = 1
+    self.num_tokens = num_tokens
     self.n_blocks = depth
     self.n_decoder_blocks = decoder_depth
     self.mlp_ratio = mlp_ratio
@@ -227,7 +228,7 @@ class ProtNet(nn.Module):
         embed_dim=self.contour_embed_dim)
     num_patches = self.protein_patch_embed.num_patches
 
-    self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+    self.cls_token = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
     self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
     self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, decoder_embed_dim))
 
@@ -335,17 +336,17 @@ class ProtNet(nn.Module):
 
   def interpolate_pos_encoding(self, x, w, h, pos_embed, has_cls_token=True):
     previous_dtype = x.dtype
-    npatch = x.shape[1] - 1
-    N = pos_embed.shape[1] - 1
+    npatch = x.shape[1] - self.num_tokens
+    N = pos_embed.shape[1] - self.num_tokens
     dim = x.shape[-1]
     pos_embed = pos_embed.float()
-    patch_pos_embed = pos_embed[:, 1:, :dim]
+    patch_pos_embed = pos_embed[:, self.num_tokens:, :dim]
     if npatch == N and w == h:
       return (pos_embed if has_cls_token else patch_pos_embed).to(previous_dtype)
     w0 = w // self.patch_size
     h0 = h // self.patch_size
     M = int(math.sqrt(N))  # Recover the number of patches in each dimension
-    assert N == M * M
+    assert N == M * M, f'input feature has wrong size, {N} is not a square for {M}'
     kwargs = {}
     if self.interpolate_offset:
       # Historical kludge: add a small number to avoid floating point error
@@ -367,19 +368,20 @@ class ProtNet(nn.Module):
     assert (w0, h0) == patch_pos_embed.shape[-2:]
     patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
     if has_cls_token:
-      class_pos_embed = pos_embed[:, 0]
-      return torch.cat((class_pos_embed.unsqueeze(1), patch_pos_embed), dim=1).to(previous_dtype)
+      class_pos_embed = pos_embed[:, :self.num_tokens]
+      return torch.cat((class_pos_embed, patch_pos_embed), dim=1).to(previous_dtype)
     return patch_pos_embed.to(previous_dtype)
 
   def apply_feature_fusion(self, p, c):
+    M = self.num_tokens + self.num_register_tokens
     if isinstance(p, list):
       shapes = [x.shape for x in p]
-      cls_token = [x[:, :1] for x in p]
-      patch_token = [x[:, 1:].flatten(0, 1) for x in p]
+      cls_token = [x[:, :M] for x in p]
+      patch_token = [x[:, M:].flatten(0, 1) for x in p]
       patch_token = torch.cat(patch_token, dim=0).unsqueeze(0)
       c = torch.cat([x.flatten(0, 1) for x in c], dim=0).unsqueeze(0)
     else:
-      cls_token, patch_token = torch.tensor_split(p, [1], dim=1)
+      cls_token, patch_token = torch.tensor_split(p, [M], dim=1)
     # split the pos_token into c and p
     p_of_c, p_of_p = torch.tensor_split(patch_token, [self.contour_embed_dim], dim=2)
     # fusion the c into p_of_c
@@ -391,10 +393,10 @@ class ProtNet(nn.Module):
     pos_token = torch.cat([p_of_c, p_of_p], dim=-1)
     # get the final p and c
     if isinstance(p, list):
-      l = [s[0] * (s[1] - 1) for s in shapes[:-1]]
+      l = [s[0] * (s[1] - M) for s in shapes[:-1]]
       patch_token = torch.tensor_split(pos_token.squeeze(0), l, dim=0)
       p = [
-          torch.cat([cls, p.view(s[0], s[1] -1, s[2])], dim=1).contiguous()
+          torch.cat([cls, p.view(s[0], s[1] - M, s[2])], dim=1).contiguous()
           for cls, p, s in zip(cls_token, patch_token, shapes)
       ]
     else:
@@ -430,7 +432,7 @@ class ProtNet(nn.Module):
       x = blk(x)
     x = self.decoder_norm(x)
     x = self.decoder_pred(x)
-    return x[:, self.num_register_tokens + 1:]
+    return x[:, self.num_register_tokens + self.num_tokens:]
 
   def prepare_tokens_with_masks(self, x, masks=None):
     B, nc, w, h = x.shape
@@ -447,9 +449,9 @@ class ProtNet(nn.Module):
     if self.register_tokens is not None:
       px = torch.cat(
           (
-              px[:, :1],
+              px[:, :self.num_tokens],
               self.register_tokens.expand(px.shape[0], -1, -1),
-              px[:, 1:],
+              px[:, self.num_tokens:],
           ),
           dim=1,
       )
@@ -468,8 +470,8 @@ class ProtNet(nn.Module):
       x_norm = self.encoder_norm(x)
       output.append(
           {
-              'x_norm_clstoken': x_norm[:, 0],
-              'x_norm_regtokens': x_norm[:, 1 : self.num_register_tokens + 1],
+              'x_norm_clstoken': x_norm[:, :self.num_tokens],
+              'x_norm_regtokens': x_norm[:, self.num_tokens : self.num_register_tokens + self.num_tokens],
               'x_norm_patchtokens': x_norm[:, self.num_register_tokens + 1 :],
               'x_prenorm': x,
               'x_norm': x_norm,
@@ -486,8 +488,8 @@ class ProtNet(nn.Module):
     x = self.encode(px, cx)
     x_norm = self.encoder_norm(x)
     return {
-        'x_norm_clstoken': x_norm[:, 0],
-        'x_norm_regtokens': x_norm[:, 1 : self.num_register_tokens + 1],
+        'x_norm_clstoken': x_norm[:, :self.num_tokens],
+        'x_norm_regtokens': x_norm[:, self.num_tokens : self.num_register_tokens + self.num_tokens],
         'x_norm_patchtokens': x_norm[:, self.num_register_tokens + 1 :],
         'x_prenorm': x,
         'x_norm': x_norm,
@@ -518,9 +520,9 @@ class ProtNet(nn.Module):
         px = self.apply_feature_fusion(px, cx)
         if i in blocks_to_take:
           f = self.integrater_norm(px) if norm else px
-          cls_token = (output[i][:, :1] + f[:, :1]) / 2
-          pos_token = torch.cat([output[i][:, 1:], f[:, 1:]], dim=1)
-          output[i] = torch.cat([cls_token, pos_token], dim=1)
+          # cls_token = (output[i][:, :1] + f[:, :1]) / 2
+          # pos_token = torch.cat([output[i][:, 1:], f[:, 1:]], dim=1)
+          output[i] = torch.cat([output[i], f], dim=-1)
     if (len(output) != len(blocks_to_take)):
       raise RuntimeError(f'only {len(output)} / {len(blocks_to_take)} blocks found.')
     return [output[i] for i in blocks_to_take]
@@ -569,6 +571,8 @@ class ProtNet(nn.Module):
       norm: bool = True,
       contain_integrated_feature: bool = False,
   ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
+    if not self.generation_mode and contain_integrated_feature:
+      raise RuntimeError('Integrated feature is only available in generation mode.')
     if self.chunked_blocks:
       outputs = self._get_intermediate_layers_chunked(x, n, norm, contain_integrated_feature)
     else:
@@ -694,7 +698,7 @@ def prot_mamba_base(patch_size=4, num_register_tokens=0, **kwargs):
   model = ProtNet(
       block_name='mamba1',
       patch_size=patch_size,
-      embed_dim=96,
+      embed_dim=128,
       depth=12,
       num_heads=12,
       bias=False,
