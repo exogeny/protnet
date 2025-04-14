@@ -299,7 +299,7 @@ class MambaBlock(nn.Module):
       seq_idx = torch.cat([seq_idx, seq_idx.flip([1])], dim=1)
     x = self.mixer(x, seq_idx=seq_idx)
     x = torch.tensor_split(x, 2, dim=1)
-    x = x[0] + x[1].flip([1])
+    x = (1 + torch.sigmoid(x[0])) * x[1].flip([1])
     return x.contiguous()
 
   def forward_nested(self, x_list):
@@ -339,10 +339,10 @@ class MambaBlock(nn.Module):
           x = x + ffn_residual_func(x)
         x = attn_bias.split(x)
       else:
-        x = [x + attn_residual_func(x) for x in x_list]
+        x_list = [xi + attn_residual_func(xi) for xi in x_list]
         if self.mlp is not None:
-          x = [x + ffn_residual_func(x) for x in x_list]
-      return x
+          x_list = [xi + ffn_residual_func(xi) for xi in x_list]
+      return x_list
 
   def forward(self, x: Tensor) -> Tensor:
     if isinstance(x, list):
