@@ -339,7 +339,6 @@ class ProtNet(nn.Module):
     npatch = x.shape[1] - self.num_tokens
     N = pos_embed.shape[1] - self.num_tokens
     dim = x.shape[-1]
-    pos_embed = pos_embed.float()
     patch_pos_embed = pos_embed[:, self.num_tokens:, :dim]
     if npatch == N and w == h:
       return (pos_embed if has_cls_token else patch_pos_embed).to(previous_dtype)
@@ -459,7 +458,7 @@ class ProtNet(nn.Module):
     return px.contiguous(), cx.contiguous()
 
   def forward_features_list(self, x_list, masks_list):
-    x = [self.prepare_tokens_with_masks(x, masks) for x, masks in zip(x_list, masks_list)]
+    x = [self.prepare_tokens_with_masks(xi, masks) for xi, masks in zip(x_list, masks_list)]
     px = [p for p, _ in x]
     cx = [c for _, c in x]
     x = self.encode(px, cx)
@@ -471,8 +470,8 @@ class ProtNet(nn.Module):
       output.append(
           {
               'x_norm_clstoken': x_norm[:, :self.num_tokens],
-              'x_norm_regtokens': x_norm[:, self.num_tokens : self.num_register_tokens + self.num_tokens],
-              'x_norm_patchtokens': x_norm[:, self.num_register_tokens + 1 :],
+              'x_norm_regtokens': x_norm[:, self.num_tokens:self.num_register_tokens+self.num_tokens],
+              'x_norm_patchtokens': x_norm[:, self.num_register_tokens+self.num_tokens:],
               'x_prenorm': x,
               'x_norm': x_norm,
               'masks': masks,
@@ -489,8 +488,8 @@ class ProtNet(nn.Module):
     x_norm = self.encoder_norm(x)
     return {
         'x_norm_clstoken': x_norm[:, :self.num_tokens],
-        'x_norm_regtokens': x_norm[:, self.num_tokens : self.num_register_tokens + self.num_tokens],
-        'x_norm_patchtokens': x_norm[:, self.num_register_tokens + 1 :],
+        'x_norm_regtokens': x_norm[:, self.num_tokens:self.num_register_tokens+self.num_tokens],
+        'x_norm_patchtokens': x_norm[:, self.num_register_tokens+self.num_tokens:],
         'x_prenorm': x,
         'x_norm': x_norm,
         'masks': masks,
