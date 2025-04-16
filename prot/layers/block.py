@@ -1,4 +1,5 @@
 from typing import Callable, List, Any, Tuple, Dict, Optional
+import numpy as np
 import torch
 from torch import nn, Tensor
 from xformers.ops import fmha, scaled_index_add, index_select_cat
@@ -274,8 +275,10 @@ class MambaBlock(nn.Module):
       norm_cls=nn.LayerNorm,
       drop_path: float = 0.,
       init_values: float = None,
+      num_tokens: int = 0,
   ):
     super().__init__()
+    self.num_tokens = num_tokens
     self.norm1 = norm_cls(dim)
     self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
     self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
@@ -293,14 +296,60 @@ class MambaBlock(nn.Module):
     self.sample_drop_ratio = drop_path
     self.support_varlen_seq = isinstance(self.mixer, Mamba2)
 
+  def interleave_cls_patch_flexible(self, x: Tensor):
+    seg_lengths = None
+    if self.num_tokens > 1:
+      N = x.shape[1] - self.num_tokens
+      M = self.num_tokens
+      base = N // (M - 1)
+      remainder = N % (M - 1)
+
+      # Example: N=7, M=4 → base=2, remainder=1 → lens = [3,2,2]
+      seg_lengths = [base + 1 if i < remainder else base for i in range(M - 1)]
+      segments = []
+      start = M
+      for i in range(M):
+        segments.append(x[:, i:i+1, :])  # insert cls_i
+        if i < M - 1:
+            length = seg_lengths[i]
+            end = start + length
+            segments.append(x[:, start:end, :])
+            start = end
+      x = torch.cat(segments, dim=1).contiguous()
+    return x, seg_lengths
+
+  def de_interleave_cls_patch_flexible(self, x: Tensor, seg_lengths: List[int]):
+    if seg_lengths is not None:
+      M = len(seg_lengths) + 1
+      idx = 0
+      cls_tokens = []
+      patch_tokens = []
+
+      for i in range(M):
+        cls_tokens.append(x[:, idx:idx+1, :])
+        idx += 1
+        if i < M - 1:
+          patch_len = seg_lengths[i]
+          patch_tokens.append(x[:, idx:idx+patch_len, :])
+          idx += patch_len
+      x = torch.cat(
+          [
+              torch.cat(cls_tokens, dim=1),
+              torch.cat(patch_tokens, dim=1),
+          ], dim=1)
+      x = x.contiguous()
+    return x
+
   def split_and_cat_mixer(self, x: Tensor, seq_idx: Optional[Tensor] = None) -> Tensor:
+    x, seg_lengths = self.interleave_cls_patch_flexible(x)
     x = torch.cat([x, x.flip([1])], dim=1)
     if seq_idx is not None:
       seq_idx = torch.cat([seq_idx, seq_idx.flip([1])], dim=1)
     x = self.mixer(x, seq_idx=seq_idx)
     x = torch.tensor_split(x, 2, dim=1)
     x = (1 + torch.sigmoid(x[0])) * x[1].flip([1])
-    return x.contiguous()
+    x = self.de_interleave_cls_patch_flexible(x, seg_lengths)
+    return x
 
   def forward_nested(self, x_list):
     if self.training and self.sample_drop_ratio > 0.0 and self.support_varlen_seq:
@@ -322,7 +371,7 @@ class MambaBlock(nn.Module):
             x_list,
             residual_func=ffn_residual_func,
             sample_drop_ratio=self.sample_drop_ratio,
-            scaling_vector=self.ls2.gamma if isinstance(self.ls1, LayerScale) else None,
+            scaling_vector=self.ls2.gamma if isinstance(self.ls2, LayerScale) else None,
         )
       return x_list
     else:
@@ -330,14 +379,14 @@ class MambaBlock(nn.Module):
         return self.ls1(self.split_and_cat_mixer(self.norm1(x), seq_idx=seq_idx))
 
       def ffn_residual_func(x: Tensor) -> Tensor:
-          return self.ls2(self.mlp(self.norm2(x)))
+        return self.ls2(self.mlp(self.norm2(x)))
 
       if self.support_varlen_seq:
         (attn_bias, seq_idx), x = get_attn_bias_and_cat(x_list, have_seq_idx=True)
         x = x + attn_residual_func(x, seq_idx=seq_idx)
         if self.mlp is not None:
           x = x + ffn_residual_func(x)
-        x = attn_bias.split(x)
+        x_list = attn_bias.split(x)
       else:
         x_list = [xi + attn_residual_func(xi) for xi in x_list]
         if self.mlp is not None:

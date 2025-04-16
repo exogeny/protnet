@@ -207,7 +207,9 @@ class SSLMetaArch(nn.Module):
         teacher_cls_tokens_after_head = self.teacher.dino_head(teacher_cls_tokens)
         masked_teacher_ibot_softmaxed_centered = None
 
+      # we treat all cls tokens of one image as single one token
       teacher_cls_tokens_after_head = teacher_cls_tokens_after_head.unflatten(0, (-1, self.num_tokens))
+      teacher_cls_tokens_after_head = teacher_cls_tokens_after_head.flatten(1, 2)
       if self.cfg.train.centering == 'centering':
         teacher_dino_softmaxed_centered_list = self.dino_loss.softmax_center_teacher(
             teacher_cls_tokens_after_head, teacher_temp=teacher_temp
@@ -306,9 +308,11 @@ class SSLMetaArch(nn.Module):
 
     # 3a: local crops cls tokens
     student_local_cls_tokens_after_head = outputs_list.pop(0).squeeze(0).unflatten(0, (-1, self.num_tokens))
+    student_local_cls_tokens_after_head = student_local_cls_tokens_after_head.flatten(1, 2)
 
     # 3b: global crops cls tokens
     student_global_cls_tokens_after_head = outputs_list.pop(0).squeeze(0).unflatten(0, (-1, self.num_tokens))
+    student_global_cls_tokens_after_head = student_global_cls_tokens_after_head.flatten(1, 2)
 
     # 3c: global crops patch tokens
     if do_ibot and not self.ibot_separate_head:

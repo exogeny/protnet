@@ -14,7 +14,7 @@ class DINOLoss(nn.Module):
     super().__init__()
     self.student_temp = student_temp
     self.center_momentum = center_momentum
-    self.register_buffer("center", torch.zeros(num_tokens, out_dim))
+    self.register_buffer("center", torch.zeros(1, num_tokens * out_dim))
     self.updated = True
     self.reduce_handle = None
     self.len_teacher_output = None

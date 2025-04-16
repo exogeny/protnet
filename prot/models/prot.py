@@ -48,6 +48,7 @@ def create_block(
     qkv_bias: bool,
     proj_bias: bool,
     ffn_bias: bool,
+    num_tokens: int = 0,
     drop_path: Optional[float] = None,
     init_values: Optional[float] = None,
     layer_idx: Optional[int] = None,
@@ -98,6 +99,7 @@ def create_block(
         norm_cls=norm_layer,
         drop_path=drop_path,
         init_values=init_values,
+        num_tokens=num_tokens,
     )
     block.layer_idx = layer_idx
     return block
@@ -264,6 +266,7 @@ class ProtNet(nn.Module):
         dim=embed_dim,
         num_heads=num_heads,
         drop_paths=dpr,
+        num_tokens=num_tokens,
         **common_block_kwargs,
     )
     self.contour_encoder_blocks = create_blocks(
@@ -314,6 +317,7 @@ class ProtNet(nn.Module):
     nn.init.normal_(self.cls_token, std=1e-6)
     if self.register_tokens is not None:
         nn.init.normal_(self.register_tokens, std=1e-6)
+    named_apply(init_weights_vit_timm, self)
     if self.block_name in ['mamba1', 'mamba2']:
         named_apply(partial(
             init_weights_ssm,
@@ -321,8 +325,6 @@ class ProtNet(nn.Module):
             n_decoder_blocks=self.n_decoder_blocks,
             n_residuals_per_layer=int(self.mlp_ratio > 0) + 1),
         self)
-    else:
-      named_apply(init_weights_vit_timm, self)
 
   def unpatchify(self, patch_tokens):
     B, N, C = patch_tokens.shape
@@ -372,15 +374,16 @@ class ProtNet(nn.Module):
     return patch_pos_embed.to(previous_dtype)
 
   def apply_feature_fusion(self, p, c):
-    M = self.num_tokens + self.num_register_tokens
+    M = self.num_tokens
+    R = self.num_register_tokens
     if isinstance(p, list):
       shapes = [x.shape for x in p]
-      cls_token = [x[:, :M] for x in p]
-      patch_token = [x[:, M:].flatten(0, 1) for x in p]
+      cls_token = [x[:, :M+R] for x in p]
+      patch_token = [x[:, M+R:].flatten(0, 1) for x in p]
       patch_token = torch.cat(patch_token, dim=0).unsqueeze(0)
       c = torch.cat([x.flatten(0, 1) for x in c], dim=0).unsqueeze(0)
     else:
-      cls_token, patch_token = torch.tensor_split(p, [M], dim=1)
+      cls_token, patch_token = torch.tensor_split(p, [M+R], dim=1)
     # split the pos_token into c and p
     p_of_c, p_of_p = torch.tensor_split(patch_token, [self.contour_embed_dim], dim=2)
     # fusion the c into p_of_c
@@ -392,10 +395,10 @@ class ProtNet(nn.Module):
     pos_token = torch.cat([p_of_c, p_of_p], dim=-1)
     # get the final p and c
     if isinstance(p, list):
-      l = [s[0] * (s[1] - M) for s in shapes[:-1]]
+      l = [s[0] * (s[1] - M - R) for s in shapes[:-1]]
       patch_token = torch.tensor_split(pos_token.squeeze(0), l, dim=0)
       p = [
-          torch.cat([cls, p.view(s[0], s[1] - M, s[2])], dim=1).contiguous()
+          torch.cat([cls, p.view(s[0], s[1] - M - R, s[2])], dim=1).contiguous()
           for cls, p, s in zip(cls_token, patch_token, shapes)
       ]
     else:
@@ -576,8 +579,8 @@ class ProtNet(nn.Module):
       outputs = self._get_intermediate_layers_chunked(x, n, norm, contain_integrated_feature)
     else:
       outputs = self._get_intermediate_layers_not_chunked(x, n, norm, contain_integrated_feature)
-    class_tokens = [out[:, 0] for out in outputs]
-    outputs = [out[:, 1+self.num_register_tokens:, self.contour_embed_dim:] for out in outputs]
+    class_tokens = [out[:, :self.num_tokens].flatten(1, 2) for out in outputs]
+    outputs = [out[:, self.num_tokens+self.num_register_tokens:] for out in outputs]
     if reshape:
       B, _, w, h = x.shape
       outputs = [
@@ -676,24 +679,7 @@ def prot_base(patch_size=16, num_register_tokens=0, **kwargs):
   return model
 
 
-def prot_mamba_small(patch_size=16, num_register_tokens=0, **kwargs):
-  model = ProtNet(
-      block_name='mamba2',
-      patch_size=patch_size,
-      embed_dim=384,
-      depth=12,
-      num_heads=6,
-      decoder_embed_dim=256,
-      decoder_num_heads=6,
-      bias=False,
-      num_register_tokens=num_register_tokens,
-      norm_layer = partial(RMSNorm, eps=1e-5),
-      **kwargs,
-  )
-  return model
-
-
-def prot_mamba_base(patch_size=4, num_register_tokens=0, **kwargs):
+def prot_mamba_base(patch_size=8, num_register_tokens=0, **kwargs):
   model = ProtNet(
       block_name='mamba1',
       patch_size=patch_size,
