@@ -82,7 +82,7 @@ def get_params_groups_with_decay(model, lr_decay_rate=1.0, patch_embed_lr_mult=1
         'params': param,
         'is_last_layer': False,
         'lr_multiplier': decay_rate,
-        'wd_multiplier': 1.0,
+        'wd_multiplier': 0.0 if getattr(param, '_no_weight_decay', False) else 1.0,
         'name': name
     }
 

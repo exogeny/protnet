@@ -40,6 +40,11 @@ def init(
 
 
 def log(*args, **kwargs):
-  import wandb
   if WANDB_AVAILABLE:
+    import wandb
     wandb.log(*args, **kwargs)
+
+def histogram(name, data):
+  if WANDB_AVAILABLE:
+    import wandb
+    wandb.log({name: wandb.Histogram(data)})

@@ -1,7 +1,7 @@
 from typing import Callable, List, Any, Tuple, Dict, Optional
-import numpy as np
 import torch
 from torch import nn, Tensor
+from einops import rearrange
 from xformers.ops import fmha, scaled_index_add, index_select_cat
 
 from prot.layers import Attention
@@ -293,6 +293,8 @@ class MambaBlock(nn.Module):
       self.mlp = None
       self.ls2 = None
       self.drop_path2 = None
+    if self.num_tokens > 1:
+      self.cls_linear = nn.Linear(self.num_tokens, self.num_tokens, bias=False)
     self.sample_drop_ratio = drop_path
     self.support_varlen_seq = isinstance(self.mixer, Mamba2)
 
@@ -336,19 +338,24 @@ class MambaBlock(nn.Module):
           [
               torch.cat(cls_tokens, dim=1),
               torch.cat(patch_tokens, dim=1),
-          ], dim=1)
-      x = x.contiguous()
+          ], dim=1).contiguous()
     return x
 
   def split_and_cat_mixer(self, x: Tensor, seq_idx: Optional[Tensor] = None) -> Tensor:
     x, seg_lengths = self.interleave_cls_patch_flexible(x)
     x = torch.cat([x, x.flip([1])], dim=1)
-    if seq_idx is not None:
-      seq_idx = torch.cat([seq_idx, seq_idx.flip([1])], dim=1)
     x = self.mixer(x, seq_idx=seq_idx)
     x = torch.tensor_split(x, 2, dim=1)
-    x = (1 + torch.sigmoid(x[0])) * x[1].flip([1])
+    x = (1 + torch.tanh(x[0])) * x[1].flip([1])
     x = self.de_interleave_cls_patch_flexible(x, seg_lengths)
+    if self.num_tokens > 1:
+      cls_tokens, patch_tokens = x.tensor_split([self.num_tokens], dim=1)
+      cls_tokens = rearrange(
+          self.cls_linear(
+              rearrange(cls_tokens, 'b n d -> b d n')),
+          'b d n -> b n d'
+      )
+      x = torch.cat([cls_tokens, patch_tokens], dim=1)
     return x
 
   def forward_nested(self, x_list):
@@ -381,7 +388,12 @@ class MambaBlock(nn.Module):
       def ffn_residual_func(x: Tensor) -> Tensor:
         return self.ls2(self.mlp(self.norm2(x)))
 
-      if self.support_varlen_seq:
+      if self.training and self.sample_drop_ratio > 0.0:
+        # training and not support_varlen_seq
+        x_list = [xi + self.drop_path1(attn_residual_func(xi)) for xi in x_list]
+        if self.mlp is not None:
+          x_list = [xi + self.drop_path2(ffn_residual_func(xi)) for xi in x_list]
+      elif self.support_varlen_seq:
         (attn_bias, seq_idx), x = get_attn_bias_and_cat(x_list, have_seq_idx=True)
         x = x + attn_residual_func(x, seq_idx=seq_idx)
         if self.mlp is not None:

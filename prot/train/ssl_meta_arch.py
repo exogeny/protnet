@@ -1,7 +1,6 @@
 from functools import partial
 import logging
 
-import math
 import torch
 from torch import nn
 from xformers.ops import fmha
@@ -10,6 +9,7 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 from prot.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss
 from prot.models import build_model_from_cfg
 from prot.layers import BlockChunk, DINOHead
+from prot.utils import wandb
 from prot.utils.utils import has_batchnorms
 from prot.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
 from prot.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
@@ -65,14 +65,17 @@ class SSLMetaArch(nn.Module):
       self.dino_loss_weight = cfg.dino.loss_weight
       dino_head = partial(
           DINOHead,
-          in_dim=embed_dim,
+          in_dim=embed_dim * self.num_tokens if self.ibot_separate_head else embed_dim,
           out_dim=cfg.dino.head_n_prototypes,
           hidden_dim=cfg.dino.head_hidden_dim,
           bottleneck_dim=cfg.dino.head_bottleneck_dim,
           nlayers=cfg.dino.head_nlayers,
           mlp_bias=cfg.dino.head_mlp_bias,
       )
-      self.dino_loss = DINOLoss(self.dino_out_dim, self.num_tokens)
+      self.dino_loss = DINOLoss(
+          self.dino_out_dim,
+          self.num_tokens if not self.ibot_separate_head else 1
+      )
       if self.do_koleo:
         logger.info('OPTIONS -- DINO -- applying KOLEO regularization')
         self.koleo_loss = KoLeoLoss()
@@ -172,12 +175,12 @@ class SSLMetaArch(nn.Module):
       teacher_cls_tokens = teacher_cls_tokens.chunk(n_global_crops_teacher)
       # watch out: these are chunked and cat'd in reverse so A is matched to B in the global crops dino loss
       teacher_cls_tokens = torch.cat((teacher_cls_tokens[1], teacher_cls_tokens[0]), dim=0)
-      teacher_cls_tokens = teacher_cls_tokens.flatten(0, 1)
       ibot_teacher_patch_tokens = teacher_backbone_output_dict['x_norm_patchtokens']
       _dim = ibot_teacher_patch_tokens.shape[-1]
       n_cls_tokens = teacher_cls_tokens.shape[0]
 
       if do_ibot and not self.ibot_separate_head:
+        teacher_cls_tokens = teacher_cls_tokens.flatten(0, 1)
         buffer_tensor_teacher = ibot_teacher_patch_tokens.new_zeros(upperbound + n_cls_tokens, _dim)
         buffer_tensor_teacher[:n_cls_tokens].copy_(teacher_cls_tokens)
         torch.index_select(
@@ -199,17 +202,20 @@ class SSLMetaArch(nn.Module):
             index=mask_indices_list,
             out=buffer_tensor_teacher[:n_masked_patches],
         )
+        teacher_cls_tokens = teacher_cls_tokens.flatten(1, 2)
         teacher_cls_tokens_after_head = self.teacher.dino_head(teacher_cls_tokens)
         masked_teacher_patch_tokens_after_head = self.teacher.ibot_head(buffer_tensor_teacher)[
             :n_masked_patches
         ]
       else:
+        teacher_cls_tokens = teacher_cls_tokens.flatten(0, 1)
         teacher_cls_tokens_after_head = self.teacher.dino_head(teacher_cls_tokens)
         masked_teacher_ibot_softmaxed_centered = None
 
-      # we treat all cls tokens of one image as single one token
-      teacher_cls_tokens_after_head = teacher_cls_tokens_after_head.unflatten(0, (-1, self.num_tokens))
-      teacher_cls_tokens_after_head = teacher_cls_tokens_after_head.flatten(1, 2)
+      if not self.ibot_separate_head:
+        # we treat all cls tokens of one image as single one token
+        teacher_cls_tokens_after_head = teacher_cls_tokens_after_head.unflatten(0, (-1, self.num_tokens))
+        teacher_cls_tokens_after_head = teacher_cls_tokens_after_head.flatten(1, 2)
       if self.cfg.train.centering == 'centering':
         teacher_dino_softmaxed_centered_list = self.dino_loss.softmax_center_teacher(
             teacher_cls_tokens_after_head, teacher_temp=teacher_temp
@@ -277,14 +283,15 @@ class SSLMetaArch(nn.Module):
 
     inputs_for_student_head_list = []
 
+    s, e = (1, 2) if self.ibot_separate_head else (0, 1)
     # 1a: local crops cls tokens
     student_local_cls_tokens = student_local_backbone_output_dict['x_norm_clstoken']
-    student_local_cls_tokens = student_local_cls_tokens.flatten(0, 1)
+    student_local_cls_tokens = student_local_cls_tokens.flatten(s, e)
     inputs_for_student_head_list.append(student_local_cls_tokens.unsqueeze(0))
 
     # 1b: global crops cls tokens
     student_global_cls_tokens = student_global_backbone_output_dict['x_norm_clstoken']
-    student_global_cls_tokens = student_global_cls_tokens.flatten(0, 1)
+    student_global_cls_tokens = student_global_cls_tokens.flatten(s, e)
     inputs_for_student_head_list.append(student_global_cls_tokens.unsqueeze(0))
 
     # 1c: global crops patch tokens
@@ -307,12 +314,16 @@ class SSLMetaArch(nn.Module):
     outputs_list = _attn_bias.split(self.student.dino_head(cat_inputs))
 
     # 3a: local crops cls tokens
-    student_local_cls_tokens_after_head = outputs_list.pop(0).squeeze(0).unflatten(0, (-1, self.num_tokens))
-    student_local_cls_tokens_after_head = student_local_cls_tokens_after_head.flatten(1, 2)
+    student_local_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
+    if not self.ibot_separate_head:
+      student_local_cls_tokens_after_head = student_local_cls_tokens_after_head.unflatten(
+          0, (-1, self.num_tokens)).flatten(1, 2)
 
     # 3b: global crops cls tokens
-    student_global_cls_tokens_after_head = outputs_list.pop(0).squeeze(0).unflatten(0, (-1, self.num_tokens))
-    student_global_cls_tokens_after_head = student_global_cls_tokens_after_head.flatten(1, 2)
+    student_global_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
+    if not self.ibot_separate_head:
+      student_global_cls_tokens_after_head = student_global_cls_tokens_after_head.unflatten(
+          0, (-1, self.num_tokens)).flatten(1, 2)
 
     # 3c: global crops patch tokens
     if do_ibot and not self.ibot_separate_head:
@@ -344,8 +355,7 @@ class SSLMetaArch(nn.Module):
       loss_accumulator += self.dino_loss_weight * dino_global_crops_loss
 
       if self.do_koleo:
-        student_cls_tokens = student_global_cls_tokens.unflatten(0, (-1, self.num_tokens))
-        student_cls_tokens = student_cls_tokens.flatten(1, 2)
+        student_cls_tokens = student_global_cls_tokens
         koleo_loss = self.cfg.dino.koleo_loss_weight * sum(
             self.koleo_loss(p) for p in student_cls_tokens.chunk(2)
         )  # we don't apply koleo loss between cls tokens of a same image
@@ -369,6 +379,8 @@ class SSLMetaArch(nn.Module):
       loss_dict['ibot_loss'] = ibot_patch_loss / 2
       loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
 
+    loss_dict['total_loss'] = loss_accumulator
+    loss_dict['teacher_cls_tokens'] = teacher_dino_softmaxed_centered_list.max()
     self.backprop_loss(loss_accumulator)
     self.fsdp_synchronize_streams()
     return loss_dict

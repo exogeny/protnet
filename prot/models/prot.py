@@ -76,7 +76,8 @@ def create_block(
       mixer_cls = partial(
           Mamba,
           d_state=16,
-          layer_idx=layer_idx
+          dt_rank=32,
+          layer_idx=layer_idx,
       )
     else:
       mixer_cls = partial(
@@ -222,17 +223,18 @@ class ProtNet(nn.Module):
         img_size=img_size,
         patch_size=patch_size,
         in_chans=1,
-        embed_dim=embed_dim)
+        embed_dim=embed_dim,
+    )
     self.contour_patch_embed = embed_layer(
         img_size=img_size,
         patch_size=patch_size,
         in_chans=2,
-        embed_dim=self.contour_embed_dim)
+        embed_dim=self.contour_embed_dim,
+    )
     num_patches = self.protein_patch_embed.num_patches
 
     self.cls_token = nn.Parameter(torch.zeros(1, self.num_tokens, embed_dim))
     self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
-    self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, decoder_embed_dim))
 
     assert num_register_tokens >= 0
     self.register_tokens = (
@@ -267,6 +269,7 @@ class ProtNet(nn.Module):
         num_heads=num_heads,
         drop_paths=dpr,
         num_tokens=num_tokens,
+        layer_idx_offset=depth,
         **common_block_kwargs,
     )
     self.contour_encoder_blocks = create_blocks(
@@ -280,6 +283,9 @@ class ProtNet(nn.Module):
     )
     self.encoder_norm = norm_layer(embed_dim)
 
+    if generation_mode or reconstruction_mode:
+      self.decoder_pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, decoder_embed_dim))
+
     if generation_mode:
       # intergrater
       self.integrater_embed = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -289,6 +295,7 @@ class ProtNet(nn.Module):
           dim=embed_dim,
           num_heads=num_heads,
           drop_paths=dpr,
+          layer_idx_offset=depth,
           **common_block_kwargs,
       )
       self.integrater_norm = norm_layer(embed_dim)
@@ -303,6 +310,7 @@ class ProtNet(nn.Module):
           dim=decoder_embed_dim,
           num_heads=decoder_num_heads,
           drop_paths=dpr_decoder,
+          layer_idx_offset=depth,
           **common_block_kwargs,
       )
       self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * 3, bias=bias)
@@ -313,7 +321,8 @@ class ProtNet(nn.Module):
 
   def init_weights(self):
     trunc_normal_(self.pos_embed, std=0.02)
-    trunc_normal_(self.decoder_pos_embed, std=0.02)
+    if self.generation_mode or self.reconstruction_mode:
+      trunc_normal_(self.decoder_pos_embed, std=0.02)
     nn.init.normal_(self.cls_token, std=1e-6)
     if self.register_tokens is not None:
         nn.init.normal_(self.register_tokens, std=1e-6)
@@ -387,7 +396,6 @@ class ProtNet(nn.Module):
     # split the pos_token into c and p
     p_of_c, p_of_p = torch.tensor_split(patch_token, [self.contour_embed_dim], dim=2)
     # fusion the c into p_of_c
-    # p_of_c = 0.5 * (p_of_c + c)
     ratio = torch.tanh(torch.mean(p_of_p, dim=2, keepdim=True))
     p_of_c = p_of_c + ratio * c
     p_of_c_mean = torch.mean(p_of_c, dim=2, keepdim=True)
@@ -683,9 +691,11 @@ def prot_mamba_base(patch_size=8, num_register_tokens=0, **kwargs):
   model = ProtNet(
       block_name='mamba1',
       patch_size=patch_size,
-      embed_dim=128,
+      embed_dim=64,
       depth=12,
-      num_heads=12,
+      num_heads=4,
+      decoder_embed_dim=48,
+      decoder_num_heads=4,
       bias=False,
       num_register_tokens=num_register_tokens,
       norm_layer = partial(RMSNorm, eps=1e-5),
